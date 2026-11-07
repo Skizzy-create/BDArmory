@@ -1205,7 +1205,7 @@ namespace BDArmory.Weapons.Missiles
                     else*/
                     if (angleToTarget < maxOffBoresight || TimeIndex < 3) //Give non-SARH VLS-launched missiles a 3sec grace period after launch to tip over towards target first before checking boresight
                     {
-                        if (scannedTargets == null) scannedTargets = new TargetSignatureData[BDATargetManager.LoadedVessels.Count];
+                        if (scannedTargets == null || scannedTargets.Length < BDATargetManager.LoadedVessels.Count) scannedTargets = new TargetSignatureData[Mathf.Max(1, BDATargetManager.LoadedVessels.Count)]; // Grow with the number of loaded vessels (was allocated once, possibly too small or empty).
                         //TargetSignatureData.ResetTSDArray(ref scannedTargets);
                         Ray ray = new Ray(transform.position, vectorToTarget);
                         bool pingRWR = Time.time >= nextRWRPing;
@@ -1362,7 +1362,7 @@ namespace BDArmory.Weapons.Missiles
             {
                 // not locked on before launch, trying lock-on after launch:
 
-                if (scannedTargets == null) scannedTargets = new TargetSignatureData[BDATargetManager.LoadedVessels.Count];
+                if (scannedTargets == null || scannedTargets.Length < BDATargetManager.LoadedVessels.Count) scannedTargets = new TargetSignatureData[Mathf.Max(1, BDATargetManager.LoadedVessels.Count)]; // Grow with the number of loaded vessels (was allocated once, possibly too small or empty).
                 //TargetSignatureData.ResetTSDArray(ref scannedTargets);
                 Vector3 forward = GetForwardTransform();
                 Ray ray = new Ray(transform.position, forward);
@@ -1546,6 +1546,227 @@ namespace BDArmory.Weapons.Missiles
                 }
             }
         }
+
+        #region Retargeting
+        TargetInfo retargetTrackedTarget = null; // The target being watched for destruction.
+        Vessel retargetTrackedVessel = null;
+        bool retargetTrackedWasThreat = false;
+        float retargetNextThreatCheckTime = 0f;
+        float retargetNextSearchTime = 0f;
+        float retargetGiveUpTime = -1f; // >= 0 while looking for a replacement for a destroyed target.
+        int retargetCount = 0;
+        const int MaxRetargets = 5;
+        const float RetargetInterval = 0.25f;
+
+        /// <summary>
+        /// If the missile's target has been destroyed (or reduced to uncommandable debris), redirect the missile to the nearest remaining hostile
+        /// that its seeker/guidance can engage. Called at the start of the guidance update (before the miss checks).
+        /// - Heat: targets within the seeker's gimbal limits (maxOffBoresight); the seeker is pointed at the new target
+        ///   (in guard mode GetHeatTarget only accepts the missile's targetVessel, so heat missiles could never switch on their own).
+        /// - Radar: targets locked by the guiding radar (SARH/datalink; the radar is asked to lock the target if needed), or within the active seeker's range and gimbal limits.
+        /// - GPS (with datalink updates) / Inertial: targets recently detected by the missile's team.
+        /// Laser, anti-radiation and unguided missiles aren't retargeted (they follow the designator/emitter).
+        /// MissileFire's missilesAway bookkeeping follows automatically, since it's recalculated from each fired missile's targetVessel every frame.
+        /// </summary>
+        protected void CheckRetarget()
+        {
+            if (!BDArmorySettings.MISSILE_RETARGETING || !HasFired || HasExploded || HasMissed || Team == null) return;
+            switch (TargetingMode)
+            {
+                case TargetingModes.Heat:
+                case TargetingModes.Radar:
+                case TargetingModes.Inertial:
+                    break;
+                case TargetingModes.Gps:
+                    if (gpsUpdates < 0f) return; // GPS without datalink updates just flies to the coordinates it was given.
+                    break;
+                default:
+                    return;
+            }
+
+            var current = targetVessel; // The getter clears targets whose vessel is gone.
+            if (current != null && current != retargetTrackedTarget) // New target: the initial target, or the missile's own seeker switched targets.
+            {
+                retargetTrackedTarget = current;
+                retargetTrackedVessel = current.Vessel;
+                retargetTrackedWasThreat = current.isThreat;
+                retargetGiveUpTime = -1f;
+                return;
+            }
+            if (retargetTrackedTarget is null) return; // Never had a target (C# null check, not Unity's).
+
+            if (retargetGiveUpTime < 0f)
+            {
+                if (!TrackedTargetDestroyed()) return;
+                if (retargetCount >= MaxRetargets)
+                {
+                    ForgetTrackedTarget();
+                    return;
+                }
+                retargetGiveUpTime = Time.time + Mathf.Max(seekerTimeout, 1f); // Keep looking for a while (e.g. while the radar acquires a lock).
+                retargetNextSearchTime = 0f; // Search immediately.
+                if (BDArmorySettings.DEBUG_MISSILES) Debug.Log($"[BDArmory.MissileBase]: {shortName} with UUID: {vessel.id}: target {TargetVesselName} destroyed, looking for a new target.");
+            }
+            if (Time.time > retargetGiveUpTime)
+            {
+                ForgetTrackedTarget();
+                return;
+            }
+            if (Time.time < retargetNextSearchTime) return;
+            retargetNextSearchTime = Time.time + RetargetInterval;
+
+            var newTarget = FindRetarget(retargetTrackedTarget);
+            if (newTarget == null || !ApplyRetarget(newTarget)) return; // Try again at the next search until we give up.
+            ++retargetCount;
+            checkMiss = false; // The miss check was relative to the old target.
+            if (BDArmorySettings.DEBUG_MISSILES) Debug.Log($"[BDArmory.MissileBase]: {shortName} with UUID: {vessel.id}: retargeted to {newTarget.Vessel.vesselName} ({retargetCount}/{MaxRetargets}).");
+            retargetTrackedTarget = newTarget;
+            retargetTrackedVessel = newTarget.Vessel;
+            retargetTrackedWasThreat = newTarget.isThreat;
+            retargetGiveUpTime = -1f;
+        }
+
+        bool TrackedTargetDestroyed()
+        {
+            if (retargetTrackedTarget == null || retargetTrackedVessel == null || retargetTrackedTarget.Vessel == null) return true; // Unity null checks: vessel/TargetInfo destroyed.
+            if (Time.time < retargetNextThreatCheckTime) return false;
+            retargetNextThreatCheckTime = Time.time + RetargetInterval;
+            bool isThreat = retargetTrackedTarget.isThreat;
+            if (retargetTrackedWasThreat && !isThreat) return true; // Reduced to debris (lost its command parts) or a missile that has missed.
+            retargetTrackedWasThreat |= isThreat;
+            return false;
+        }
+
+        void ForgetTrackedTarget()
+        {
+            retargetTrackedTarget = null;
+            retargetTrackedVessel = null;
+            retargetTrackedWasThreat = false;
+            retargetGiveUpTime = -1f;
+        }
+
+        VesselRadarData RetargetRadarSource => vrd != null ? vrd : (FiredByWM != null ? FiredByWM.vesselRadarData : null);
+
+        static TargetSignatureData FindRadarLock(VesselRadarData radarData, Vessel v)
+        {
+            if (radarData == null || !radarData.locked || v == null) return TargetSignatureData.noTarget;
+            var locks = radarData.GetLockedTargets();
+            for (int i = 0; i < locks.Count; ++i)
+                if (locks[i].exists && locks[i].vessel == v) return locks[i];
+            return TargetSignatureData.noTarget;
+        }
+
+        bool ActiveSeekerCanAcquire(float sqrDist, float angle) => activeRadarRange > 0f && sqrDist < activeRadarRange * activeRadarRange && angle < maxOffBoresight * 0.75f;
+
+        /// <summary>
+        /// Find the nearest hostile (relative to the missile) that the missile's seeker/guidance can engage, preferring targets that don't already have the launching WM's allowance of missiles.
+        /// </summary>
+        TargetInfo FindRetarget(TargetInfo deadTarget)
+        {
+            Vector3 position = vessel.CoM;
+            Vector3 forward = GetForwardTransform();
+            VesselRadarData radarSource = TargetingMode == TargetingModes.Radar ? RetargetRadarSource : null;
+            TargetInfo best = null;
+            float bestScore = float.MaxValue;
+            var targets = BDATargetManager.TargetList(Team);
+            for (int i = 0; i < targets.Count; ++i)
+            {
+                var t = targets[i];
+                if (t == null || t.Vessel == null || (object)t == (object)deadTarget) continue;
+                if (t.Vessel == vessel || t.Vessel == SourceVessel) continue;
+                if (!Team.IsEnemy(t.Team) || !t.isThreat) continue;
+                if (!t.isMissile && t.WeaponManager == null) continue;
+                if (!CheckTargetEngagementEnvelope(t)) continue;
+                Vector3 relPos = t.position - position;
+                float sqrDist = relPos.sqrMagnitude;
+                float angle = VectorUtils.Angle(forward, relPos);
+                switch (TargetingMode)
+                {
+                    case TargetingModes.Heat:
+                        if (angle > maxOffBoresight) continue; // Outside the seeker's gimbal limits.
+                        break;
+                    case TargetingModes.Radar:
+                        if (angle > maxOffBoresight) continue;
+                        if (!ActiveSeekerCanAcquire(sqrDist, angle) && radarSource == null) continue; // Needs a radar lock to guide on.
+                        break;
+                    default: // GPS / Inertial: needs to have been detected recently.
+                        if (!(t.detectedTime.TryGetValue(Team, out float detectedTime) && Time.time - detectedTime < 5f)) continue;
+                        break;
+                }
+                bool saturated = FiredByWM != null && FiredByWM.GetMissilesAway(t).numAway >= FiredByWM.maxMissilesOnTarget;
+                float score = saturated ? 16f * sqrDist : sqrDist; // Prefer unsaturated targets unless a saturated one is much closer.
+                if (score < bestScore)
+                {
+                    best = t;
+                    bestScore = score;
+                }
+            }
+            return best;
+        }
+
+        /// <summary>
+        /// Point the missile's guidance at the new target.
+        /// </summary>
+        bool ApplyRetarget(TargetInfo newTarget)
+        {
+            Vector3 relPos = newTarget.position - vessel.CoM;
+            switch (TargetingMode)
+            {
+                case TargetingModes.Heat:
+                    targetVessel = newTarget;
+                    heatTarget = TargetSignatureData.noTarget;
+                    predictedHeatTarget = new TargetSignatureData(newTarget.Vessel, 0f); // Point the seeker at the new target.
+                    _lockFailTimer = 0;
+                    break;
+                case TargetingModes.Radar:
+                    {
+                        var radarSource = RetargetRadarSource;
+                        bool activeAcquire = ActiveSeekerCanAcquire(relPos.sqrMagnitude, VectorUtils.Angle(GetForwardTransform(), relPos));
+                        var lockData = FindRadarLock(radarSource, newTarget.Vessel);
+                        if (!lockData.exists && !activeAcquire && radarSource != null)
+                        {
+                            radarSource.TryLockTarget(newTarget.Vessel); // The lock shows up after the radar updates; picked up at the next search.
+                            lockData = FindRadarLock(radarSource, newTarget.Vessel);
+                        }
+                        if (lockData.exists) // Guide on the radar lock (SARH/datalink), switching to the active seeker once in range.
+                        {
+                            vrd = radarSource;
+                            radarTarget = lockData;
+                            if (!activeAcquire) ActiveRadar = false;
+                        }
+                        else if (activeAcquire) // The active seeker can acquire the target directly.
+                        {
+                            radarTarget = new TargetSignatureData(newTarget.Vessel, 0f);
+                        }
+                        else return false;
+                        targetVessel = newTarget;
+                        hasLostLock = false;
+                        locksCount = 0;
+                        radarLOALSearching = false;
+                        _lockFailTimer = 0;
+                    }
+                    break;
+                case TargetingModes.Gps:
+                case TargetingModes.Inertial:
+                    targetVessel = newTarget;
+                    targetGPSCoords = VectorUtils.WorldPositionToGeoCoords(newTarget.position, vessel.mainBody);
+                    if (TargetingMode == TargetingModes.Inertial)
+                    {
+                        TargetINSCoords = targetGPSCoords;
+                        TimeOfLastINS = TimeIndex;
+                    }
+                    _lockFailTimer = 0;
+                    break;
+                default:
+                    return false;
+            }
+            TargetAcquired = true;
+            TargetPosition = newTarget.position;
+            TargetVelocity = newTarget.velocity;
+            TargetAcceleration = Vector3.zero;
+            return true;
+        }
+        #endregion Retargeting
 
         protected bool CheckTargetEngagementEnvelope(TargetInfo ti)
         {

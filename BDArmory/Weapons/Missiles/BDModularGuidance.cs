@@ -922,6 +922,7 @@ namespace BDArmory.Weapons.Missiles
         {
             if (guidanceActive)
             {
+                CheckRetarget(); // Redirect to a new target if the current one has been destroyed.
                 switch (TargetingMode)
                 {
                     case TargetingModes.None:

@@ -995,7 +995,7 @@ namespace BDArmory.Radar
 
             bool guardModeActive = weaponManager && weaponManager.guardMode;
 
-            if (!guardModeActive && (radar.locked && (radar.currentLocks == radar.maxLocks))) return false;
+            if (!guardModeActive && (radar.locked && (radar.currentLocks >= radar.EffectiveMaxLocks))) return false;
 
             // Ensure the radar's referenceTransform and related vectors are all updated...
             radar.UpdateReferenceTransform();

@@ -101,6 +101,22 @@ namespace BDArmory.Radar
         [KSPField]
         public int maxLocks = 1;					//how many targets can be locked/tracked simultaneously
 
+        /// <summary>
+        /// The number of targets this radar can lock simultaneously.
+        /// In guard mode with RADAR_LOCKS_FOLLOW_MULTITARGET enabled, lock-capable radars can lock as many targets as the weapon manager's
+        /// multi-target settings require (otherwise e.g. a 2-lock fire-control radar caps SARH/datalink missiles to 2 targets).
+        /// </summary>
+        public int EffectiveMaxLocks
+        {
+            get
+            {
+                if (!canLock || maxLocks <= 0 || !BDArmorySettings.RADAR_LOCKS_FOLLOW_MULTITARGET) return maxLocks;
+                var wm = WeaponManager;
+                if (wm == null || !wm.guardMode) return maxLocks;
+                return Math.Max(maxLocks, Mathf.CeilToInt(Mathf.Min(Mathf.Max(wm.multiMissileTgtNum, wm.multiTargetNum), MissileFire.maxAllowableTargets)));
+            }
+        }
+
         [KSPField]
         public bool canTrackWhileScan = false;      //when tracking/locking, can we still detect/scan?
 
@@ -1029,7 +1045,7 @@ namespace BDArmory.Radar
             }
 
             var weaponManager = WeaponManager;
-            if (currentLocks == maxLocks)
+            if (currentLocks >= EffectiveMaxLocks)
             {
                 if (!weaponManager.guardMode || !ClearUnneededLocks())
                 {
@@ -1366,7 +1382,7 @@ namespace BDArmory.Radar
 
         public bool ClearUnneededLocks(bool unlockAll = false)
         {
-            if (!unlockAll && (currentLocks < maxLocks))
+            if (!unlockAll && (currentLocks < EffectiveMaxLocks))
                 return true;
 
             bool cleared = false;
@@ -1389,7 +1405,7 @@ namespace BDArmory.Radar
         {
             if (wpmr != null)
             {
-                attemptedLocks = new TargetSignatureData[wpmr.MaxRadarLocks];
+                attemptedLocks = new TargetSignatureData[Math.Max(wpmr.MaxRadarLocks, 6)]; // Same minimum as on startup (MaxRadarLocks can be small or 0).
                 TargetSignatureData.ResetTSDArray(ref attemptedLocks);
                 //lockSuccesses = new bool[wpmr.MaxRadarLocks];
             }
