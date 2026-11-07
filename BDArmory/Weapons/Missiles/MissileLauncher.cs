@@ -1780,6 +1780,21 @@ namespace BDArmory.Weapons.Missiles
                 }
             }
         }
+        /// <summary>
+        /// Undo the queued launch added in FireMissile when spawning a reloadable missile fails.
+        /// Otherwise the stale queued launch counts towards maxMissilesOnTarget (and engagedTargets) for that target, and the rail can't fire again.
+        /// </summary>
+        void CancelQueuedReloadableLaunch(MissileFire firedByWM)
+        {
+            if (firedByWM != null) firedByWM.UpdateQueuedLaunches(targetVessel, this, false);
+            if (radarTarget.exists && radarTarget.lockedByRadar && radarTarget.lockedByRadar.vessel != SourceVessel)
+            {
+                MissileFire datalinkwpm = radarTarget.lockedByRadar.vessel.ActiveController().WM;
+                if (datalinkwpm) datalinkwpm.UpdateQueuedLaunches(targetVessel, this, false, false);
+            }
+            reloadableMissile = null;
+        }
+
         IEnumerator FireReloadableMissile()
         {
             var firedByWM = SourceVessel.ActiveController().WM;
@@ -1790,6 +1805,7 @@ namespace BDArmory.Weapons.Missiles
             if (!reloadableRail.SpawnMissile(MissileReferenceTransform))
             {
                 if (BDArmorySettings.DEBUG_MISSILES) Debug.LogWarning($"[BDArmory.MissileLauncher]: Failed to spawn a missile in {reloadableRail} on {vessel.vesselName}");
+                CancelQueuedReloadableLaunch(firedByWM);
                 yield break;
             }
             MissileLauncher ml = reloadableRail.SpawnedMissile.FindModuleImplementing<MissileLauncher>();
@@ -1799,6 +1815,7 @@ namespace BDArmory.Weapons.Missiles
             {
                 if (ml is not null) Destroy(ml); // The gameObject is gone, make sure the module goes too.
                 Debug.LogWarning($"[BDArmory.MissileLauncher]: Error while spawning missile with {part.name}, MissileLauncher was null!");
+                CancelQueuedReloadableLaunch(firedByWM);
                 yield break;
             }
 
@@ -2409,6 +2426,7 @@ namespace BDArmory.Weapons.Missiles
 
             if (guidanceActive)
             {
+                CheckRetarget(); // Redirect to a new target if the current one has been destroyed.
                 switch (TargetingMode)
                 {
                     case TargetingModes.Heat:

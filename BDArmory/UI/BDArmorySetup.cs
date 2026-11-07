@@ -905,8 +905,8 @@ namespace BDArmory.UI
                 { "guardAngle", gameObject.AddComponent<NumericInputField>().Initialise(0, weaponManager.guardAngle, 10, 360) },
                 { "guardRange", gameObject.AddComponent<NumericInputField>().Initialise(0, weaponManager.guardRange, 100, BDArmorySettings.MAX_GUARD_VISUAL_RANGE) },
                 { "gunRange", gameObject.AddComponent<NumericInputField>().Initialise(0, weaponManager.gunRange, 0, weaponManager.maxGunRange) },
-                { "multiTargetNum", gameObject.AddComponent<NumericInputField>().Initialise(0, weaponManager.multiTargetNum, 1, 10) },
-                { "multiMissileTgtNum", gameObject.AddComponent<NumericInputField>().Initialise(0, weaponManager.multiMissileTgtNum, 1, 10) },
+                { "multiTargetNum", gameObject.AddComponent<NumericInputField>().Initialise(0, weaponManager.multiTargetNum, 1, MissileFire.maxAllowableTargets) },
+                { "multiMissileTgtNum", gameObject.AddComponent<NumericInputField>().Initialise(0, weaponManager.multiMissileTgtNum, 1, MissileFire.maxAllowableTargets) },
                 { "maxMissilesOnTarget", gameObject.AddComponent<NumericInputField>().Initialise(0, weaponManager.maxMissilesOnTarget, 1, MissileFire.maxAllowableMissilesOnTarget) },
 
                 { "targetBias", gameObject.AddComponent<NumericInputField>().Initialise(0, weaponManager.targetBias, 0, 10) },
@@ -1553,26 +1553,26 @@ namespace BDArmory.UI
                     GUI.Label(LabelRect(++guardLines, guardLabelWidth), StringUtils.Localize("#LOC_BDArmory_WMWindow_MultiTargetNum"), leftLabel);//"Max Turret targets "
                     if (!NumFieldsEnabled)
                     {
-                        OnGUIWM.multiTargetNum = Mathf.Round(GUI.HorizontalSlider(SliderRect(guardLines, guardLabelWidth), OnGUIWM.multiTargetNum, 1, 10));
+                        OnGUIWM.multiTargetNum = Mathf.Round(GUI.HorizontalSlider(SliderRect(guardLines, guardLabelWidth), OnGUIWM.multiTargetNum, 1, MissileFire.maxAllowableTargets));
                         GUI.Label(RightLabelRect(guardLines), OnGUIWM.multiTargetNum.ToString(), leftLabel);
                     }
                     else
                     {
                         var field = textNumFields["multiTargetNum"];
-                        field.TryParseValue(GUI.TextField(InputFieldRect(guardLines, guardLabelWidth), field.possibleValue, 2, field.style));
+                        field.TryParseValue(GUI.TextField(InputFieldRect(guardLines, guardLabelWidth), field.possibleValue, 4, field.style)); // 4 chars for up to 1024
                         OnGUIWM.multiTargetNum = (float)field.CurrentValue;
                     }
 
                     GUI.Label(LabelRect(++guardLines, guardLabelWidth), StringUtils.Localize("#LOC_BDArmory_WMWindow_MultiMissileNum"), leftLabel);//"Max Turret targets "
                     if (!NumFieldsEnabled)
                     {
-                        OnGUIWM.multiMissileTgtNum = Mathf.Round(GUI.HorizontalSlider(SliderRect(guardLines, guardLabelWidth), OnGUIWM.multiMissileTgtNum, 1, 10));
+                        OnGUIWM.multiMissileTgtNum = Mathf.Round(GUI.HorizontalSlider(SliderRect(guardLines, guardLabelWidth), OnGUIWM.multiMissileTgtNum, 1, MissileFire.maxAllowableTargets));
                         GUI.Label(RightLabelRect(guardLines), OnGUIWM.multiMissileTgtNum.ToString(), leftLabel);
                     }
                     else
                     {
                         var field = textNumFields["multiMissileTgtNum"];
-                        field.TryParseValue(GUI.TextField(InputFieldRect(guardLines, guardLabelWidth), field.possibleValue, 2, field.style));
+                        field.TryParseValue(GUI.TextField(InputFieldRect(guardLines, guardLabelWidth), field.possibleValue, 4, field.style)); // 4 chars for up to 1024
                         OnGUIWM.multiMissileTgtNum = (float)field.CurrentValue;
                     }
 
@@ -1585,7 +1585,7 @@ namespace BDArmory.UI
                     else
                     {
                         var field = textNumFields["maxMissilesOnTarget"];
-                        field.TryParseValue(GUI.TextField(InputFieldRect(guardLines, guardLabelWidth), field.possibleValue, 2, field.style));
+                        field.TryParseValue(GUI.TextField(InputFieldRect(guardLines, guardLabelWidth), field.possibleValue, 3, field.style)); // 3 chars for up to 128
                         OnGUIWM.maxMissilesOnTarget = (float)field.CurrentValue;
                     }
 
