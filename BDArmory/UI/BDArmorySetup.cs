@@ -908,6 +908,8 @@ namespace BDArmory.UI
                 { "multiTargetNum", gameObject.AddComponent<NumericInputField>().Initialise(0, weaponManager.multiTargetNum, 1, MissileFire.maxAllowableTargets) },
                 { "multiMissileTgtNum", gameObject.AddComponent<NumericInputField>().Initialise(0, weaponManager.multiMissileTgtNum, 1, MissileFire.maxAllowableTargets) },
                 { "maxMissilesOnTarget", gameObject.AddComponent<NumericInputField>().Initialise(0, weaponManager.maxMissilesOnTarget, 1, MissileFire.maxAllowableMissilesOnTarget) },
+                { "parallelSalvoSize", gameObject.AddComponent<NumericInputField>().Initialise(0, weaponManager.parallelSalvoSize, 1, Mathf.Max(1, weaponManager.maxMissilesOnTarget)) },
+                { "parallelSalvoStagger", gameObject.AddComponent<NumericInputField>().Initialise(0, weaponManager.parallelSalvoStagger, 0, MissileFire.maxParallelSalvoStagger) },
 
                 { "targetBias", gameObject.AddComponent<NumericInputField>().Initialise(0, weaponManager.targetBias, 0, 10) },
                 { "targetWeightRange", gameObject.AddComponent<NumericInputField>().Initialise(0, weaponManager.targetWeightRange, -10, 10) },
@@ -1577,6 +1579,7 @@ namespace BDArmory.UI
                     }
 
                     GUI.Label(LabelRect(++guardLines, guardLabelWidth), StringUtils.Localize("#LOC_BDArmory_WMWindow_MissilesTgt"), leftLabel);//"Missiles/Tgt"
+                    float previousMissilesOnTarget = OnGUIWM.maxMissilesOnTarget;
                     if (!NumFieldsEnabled)
                     {
                         OnGUIWM.maxMissilesOnTarget = Mathf.Round(GUI.HorizontalSlider(SliderRect(guardLines, guardLabelWidth), OnGUIWM.maxMissilesOnTarget, 1, MissileFire.maxAllowableMissilesOnTarget));
@@ -1587,6 +1590,45 @@ namespace BDArmory.UI
                         var field = textNumFields["maxMissilesOnTarget"];
                         field.TryParseValue(GUI.TextField(InputFieldRect(guardLines, guardLabelWidth), field.possibleValue, 3, field.style)); // 3 chars for up to 128
                         OnGUIWM.maxMissilesOnTarget = (float)field.CurrentValue;
+                    }
+                    if (OnGUIWM.maxMissilesOnTarget != previousMissilesOnTarget) OnGUIWM.OnParallelSalvoSettingsChanged(null, null); // Salvo size is limited to Missiles/Tgt.
+
+                    // Parallel salvo firing: toggle, then the salvo size (limited to Missiles/Tgt) and the stagger between launches when enabled.
+                    string parallelFireLabel = StringUtils.Localize("#LOC_BDArmory_WMWindow_ParallelFire", OnGUIWM.parallelFire ? StringUtils.Localize("#LOC_BDArmory_Generic_On") : StringUtils.Localize("#LOC_BDArmory_Generic_Off"));//"Fire In Parallel: On/Off"
+                    if (GUI.Button(ButtonRect(++guardLines), parallelFireLabel, OnGUIWM.parallelFire ? SelectedButtonStyle : ButtonStyle))
+                    {
+                        OnGUIWM.parallelFire = !OnGUIWM.parallelFire;
+                        OnGUIWM.OnParallelSalvoSettingsChanged(null, null);
+                    }
+                    if (OnGUIWM.parallelFire)
+                    {
+                        float maxSalvoSize = Mathf.Clamp(Mathf.Round(OnGUIWM.maxMissilesOnTarget), 1, MissileFire.maxAllowableMissilesOnTarget);
+                        GUI.Label(LabelRect(++guardLines, guardLabelWidth), StringUtils.Localize("#LOC_BDArmory_WMWindow_ParallelSalvoSize"), leftLabel);//"Salvo Size/Tgt"
+                        if (!NumFieldsEnabled)
+                        {
+                            OnGUIWM.parallelSalvoSize = maxSalvoSize > 1 ? Mathf.Round(GUI.HorizontalSlider(SliderRect(guardLines, guardLabelWidth), Mathf.Min(OnGUIWM.parallelSalvoSize, maxSalvoSize), 1, maxSalvoSize)) : 1;
+                            GUI.Label(RightLabelRect(guardLines), OnGUIWM.parallelSalvoSize.ToString(), leftLabel);
+                        }
+                        else
+                        {
+                            var field = textNumFields["parallelSalvoSize"];
+                            field.maxValue = maxSalvoSize;
+                            field.TryParseValue(GUI.TextField(InputFieldRect(guardLines, guardLabelWidth), field.possibleValue, 3, field.style)); // 3 chars for up to 128
+                            OnGUIWM.parallelSalvoSize = Mathf.Clamp(Mathf.Round((float)field.CurrentValue), 1, maxSalvoSize);
+                        }
+
+                        GUI.Label(LabelRect(++guardLines, guardLabelWidth), StringUtils.Localize("#LOC_BDArmory_WMWindow_ParallelSalvoStagger"), leftLabel);//"Salvo Stagger"
+                        if (!NumFieldsEnabled)
+                        {
+                            OnGUIWM.parallelSalvoStagger = Mathf.Round(GUI.HorizontalSlider(SliderRect(guardLines, guardLabelWidth), OnGUIWM.parallelSalvoStagger, 0, MissileFire.maxParallelSalvoStagger));
+                            GUI.Label(RightLabelRect(guardLines), OnGUIWM.parallelSalvoStagger.ToString(), leftLabel);
+                        }
+                        else
+                        {
+                            var field = textNumFields["parallelSalvoStagger"];
+                            field.TryParseValue(GUI.TextField(InputFieldRect(guardLines, guardLabelWidth), field.possibleValue, 2, field.style));
+                            OnGUIWM.parallelSalvoStagger = Mathf.Clamp(Mathf.Round((float)field.CurrentValue), 0, MissileFire.maxParallelSalvoStagger);
+                        }
                     }
 
                     showTargetOptions = GUI.Toggle(ButtonRect(++guardLines), showTargetOptions, StringUtils.Localize("#LOC_BDArmory_Settings_Adv_Targeting"), showTargetOptions ? SelectedButtonStyle : ButtonStyle);//"Advanced Targeting"
@@ -2209,6 +2251,9 @@ namespace BDArmory.UI
                             GUILayout.Label(StringUtils.Localize("#LOC_BDArmory_WMWindow_MultiTargetNum_desc"), infoLinkStyle, GUILayout.Width(columnWidth - (leftIndent * 4) - 20)); //multiturrets desc
                             GUILayout.Label(StringUtils.Localize("#LOC_BDArmory_WMWindow_MultiMissileTgtNum_desc"), infoLinkStyle, GUILayout.Width(columnWidth - (leftIndent * 4) - 20)); //multiturrets desc
                             GUILayout.Label(StringUtils.Localize("#LOC_BDArmory_WMWindow_MissilesTgt_desc"), infoLinkStyle, GUILayout.Width(columnWidth - (leftIndent * 4) - 20)); //multimissiles desc
+                            GUILayout.Label(StringUtils.Localize("#LOC_BDArmory_WMWindow_ParallelFire_desc"), infoLinkStyle, GUILayout.Width(columnWidth - (leftIndent * 4) - 20)); //parallel fire desc
+                            GUILayout.Label(StringUtils.Localize("#LOC_BDArmory_WMWindow_ParallelSalvoSize_desc"), infoLinkStyle, GUILayout.Width(columnWidth - (leftIndent * 4) - 20)); //parallel salvo size desc
+                            GUILayout.Label(StringUtils.Localize("#LOC_BDArmory_WMWindow_ParallelSalvoStagger_desc"), infoLinkStyle, GUILayout.Width(columnWidth - (leftIndent * 4) - 20)); //parallel salvo stagger desc
                             GUILayout.Label(StringUtils.Localize("#LOC_BDArmory_WMWindow_TargetType_desc"), infoLinkStyle, GUILayout.Width(columnWidth - (leftIndent * 4) - 20)); //subsection targeting desc
                             GUILayout.Label(StringUtils.Localize("#LOC_BDArmory_WMWindow_EngageType_desc"), infoLinkStyle, GUILayout.Width(columnWidth - (leftIndent * 4) - 20)); //engagement toggles desc
                         }

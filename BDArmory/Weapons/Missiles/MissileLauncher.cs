@@ -1795,6 +1795,47 @@ namespace BDArmory.Weapons.Missiles
             reloadableMissile = null;
         }
 
+        /// <summary>
+        /// The spawned missile gets its target data from the WM's current state (heat target, GPS designation) once it has spawned, a frame or more after the rail was fired.
+        /// By then the WM may have moved on to another target (e.g., during a parallel salvo), so fall back to the target data the rail received when it was fired for this target.
+        /// </summary>
+        void CarryOverReloadableTargetData(MissileLauncher ml)
+        {
+            Vessel railTarget = targetVessel != null ? targetVessel.Vessel : null;
+            switch (TargetingMode)
+            {
+                case TargetingModes.Heat:
+                    if (heatTarget.exists && heatTarget.vessel != null && (railTarget == null || heatTarget.vessel == railTarget) && (!ml.heatTarget.exists || ml.heatTarget.vessel != heatTarget.vessel))
+                    {
+                        ml.heatTarget = heatTarget;
+                        if (targetVessel != null) ml.targetVessel = targetVessel;
+                    }
+                    break;
+                case TargetingModes.Radar:
+                    if (radarTarget.exists && radarTarget.vessel != null && (railTarget == null || radarTarget.vessel == railTarget) && (!ml.radarTarget.exists || ml.radarTarget.vessel != radarTarget.vessel))
+                    {
+                        ml.radarTarget = radarTarget;
+                        if (vrd != null) ml.vrd = vrd;
+                        if (targetVessel != null) ml.targetVessel = targetVessel;
+                    }
+                    break;
+                case TargetingModes.Gps:
+                    if (TargetAcquired && targetGPSCoords != Vector3d.zero && railTarget != null && vessel != null)
+                    {
+                        // Use whichever coordinates are closer to the rail's target.
+                        Vector3 targetPos = railTarget.CoM;
+                        float railError = (VectorUtils.GetWorldSurfacePostion(targetGPSCoords, vessel.mainBody) - targetPos).sqrMagnitude;
+                        if (ml.targetGPSCoords == Vector3d.zero || (VectorUtils.GetWorldSurfacePostion(ml.targetGPSCoords, vessel.mainBody) - targetPos).sqrMagnitude > railError)
+                        {
+                            ml.targetGPSCoords = targetGPSCoords;
+                            ml.TargetAcquired = true;
+                            if (targetVessel != null) ml.targetVessel = targetVessel;
+                        }
+                    }
+                    break;
+            }
+        }
+
         IEnumerator FireReloadableMissile()
         {
             var firedByWM = SourceVessel.ActiveController().WM;
@@ -1937,6 +1978,7 @@ namespace BDArmory.Weapons.Missiles
             {
                 ml.Team = FiredByWM.Team;
                 FiredByWM.SendTargetDataToMissile(ml, targetVessel != null ? targetVessel.Vessel : null, true, new MissileFire.TargetData(targetGPSCoords, TimeOfLastINS, INStimetogo), true);
+                CarryOverReloadableTargetData(ml);
                 FiredByWM.heatTarget = TargetSignatureData.noTarget;
                 ml.GpsUpdateMax = FiredByWM.GpsUpdateMax;
                 FiredByWM.UpdateQueuedLaunches(targetVessel, ml, false);

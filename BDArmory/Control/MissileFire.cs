@@ -693,6 +693,20 @@ namespace BDArmory.Control
             UI_FloatRange(minValue = 1f, maxValue = maxAllowableMissilesOnTarget, stepIncrement = 1f, scene = UI_Scene.All)]
         public float maxMissilesOnTarget = 1;
 
+        // Parallel salvo firing: each Firing Interval, fire up to parallelSalvoSize missiles at each engaged target (the current target plus the secondary missile targets) instead of one missile per interval.
+        [KSPField(isPersistant = true, guiActive = true, guiActiveEditor = true, guiName = "#LOC_BDArmory_ParallelFire"),//Fire In Parallel
+            UI_Toggle(enabledText = "#LOC_BDArmory_Enabled", disabledText = "#LOC_BDArmory_Disabled", scene = UI_Scene.All)]
+        public bool parallelFire = false;
+
+        [KSPField(isPersistant = true, guiActive = false, guiActiveEditor = false, guiName = "#LOC_BDArmory_ParallelSalvoSize"),//Salvo Size/Tgt
+            UI_FloatRange(minValue = 1f, maxValue = maxAllowableMissilesOnTarget, stepIncrement = 1f, scene = UI_Scene.All)]
+        public float parallelSalvoSize = 1;
+
+        public const float maxParallelSalvoStagger = 10f;
+        [KSPField(isPersistant = true, guiActive = false, guiActiveEditor = false, guiName = "#LOC_BDArmory_ParallelSalvoStagger"),//Salvo Stagger (frames)
+            UI_FloatRange(minValue = 0f, maxValue = maxParallelSalvoStagger, stepIncrement = 1f, scene = UI_Scene.All)]
+        public float parallelSalvoStagger = 1;
+
         #region TargetSettings
         [KSPField(isPersistant = true)]
         public bool targetCoM = true;
@@ -1641,7 +1655,41 @@ namespace BDArmory.Control
                 if (ml.part.ShieldedFromAirstream) ml.inCargoBay = true; // Override inCargoBay if we see that the missile is shielded from the airstream.
             }
 
+            SetupParallelSalvoFields();
+
             if (HighLogic.LoadedSceneIsFlight) TimingManager.FixedUpdateAdd(TimingManager.TimingStage.Earlyish, PointDefence); // Perform point defence checks before bullets get moved to avoid order of operation issues.
+        }
+
+        /// <summary>
+        /// Hook up the part menu fields for parallel salvo firing: the salvo size and stagger are only shown when parallel fire is enabled, and the salvo size is limited to Missiles/Target.
+        /// </summary>
+        void SetupParallelSalvoFields()
+        {
+            var parallelField = Fields[nameof(parallelFire)];
+            if (parallelField.uiControlFlight is UI_Toggle parallelFlight) parallelFlight.onFieldChanged = OnParallelSalvoSettingsChanged;
+            if (parallelField.uiControlEditor is UI_Toggle parallelEditor) parallelEditor.onFieldChanged = OnParallelSalvoSettingsChanged;
+            var missilesField = Fields[nameof(maxMissilesOnTarget)];
+            if (missilesField.uiControlFlight is UI_FloatRange missilesFlight) missilesFlight.onFieldChanged = OnParallelSalvoSettingsChanged;
+            if (missilesField.uiControlEditor is UI_FloatRange missilesEditor) missilesEditor.onFieldChanged = OnParallelSalvoSettingsChanged;
+            OnParallelSalvoSettingsChanged(null, null);
+        }
+
+        /// <summary>
+        /// Update the visibility and limits of the parallel salvo fields. Also called from the WM window when the settings are changed there.
+        /// </summary>
+        public void OnParallelSalvoSettingsChanged(BaseField field, object obj)
+        {
+            float maxSalvo = Mathf.Clamp(Mathf.Round(maxMissilesOnTarget), 1f, maxAllowableMissilesOnTarget);
+            parallelSalvoSize = Mathf.Clamp(Mathf.Round(parallelSalvoSize), 1f, maxSalvo);
+            parallelSalvoStagger = Mathf.Clamp(Mathf.Round(parallelSalvoStagger), 0f, maxParallelSalvoStagger);
+            var salvoField = Fields[nameof(parallelSalvoSize)];
+            salvoField.guiActive = parallelFire;
+            salvoField.guiActiveEditor = parallelFire;
+            if (salvoField.uiControlFlight is UI_FloatRange salvoFlight) salvoFlight.maxValue = maxSalvo;
+            if (salvoField.uiControlEditor is UI_FloatRange salvoEditor) salvoEditor.maxValue = maxSalvo;
+            var staggerField = Fields[nameof(parallelSalvoStagger)];
+            staggerField.guiActive = parallelFire;
+            staggerField.guiActiveEditor = parallelFire;
         }
 
         void OnPartDie()
@@ -2941,8 +2989,25 @@ namespace BDArmory.Control
         {
             if (ml && !guardFiringMissile)
             {
-                bool dumbfiring = false;
                 guardFiringMissile = true;
+                // Pump the core routine directly (rather than via StartCoroutine) so that the timing is identical to before the split.
+                var core = GuardMissileRoutineCore(tgtInfo, ml);
+                while (core.MoveNext()) yield return core.Current;
+                guardFiringMissile = false;
+                currFiringTarget = null;
+                currFiringMissile = null;
+            }
+        }
+
+        /// <summary>
+        /// Acquire the target for the missile (radar lock, heat lock, GPS coordinates, etc.), aim any missile turrets and fire the missile.
+        /// The caller is responsible for guardFiringMissile and for clearing currFiringMissile/currFiringTarget afterwards (GuardMissileRoutine, or GuardParallelSalvoRoutine for missiles that can't be fired instantly).
+        /// </summary>
+        IEnumerator GuardMissileRoutineCore(TargetInfo tgtInfo, MissileBase ml)
+        {
+            if (ml)
+            {
+                bool dumbfiring = false;
                 currFiringMissile = ml;
                 currFiringTarget = tgtInfo;
                 var wait = new WaitForFixedUpdate();
@@ -3781,9 +3846,6 @@ namespace BDArmory.Control
 
                     dumbfiring = false;
                 }
-                guardFiringMissile = false;
-                currFiringTarget = null;
-                currFiringMissile = null;
             }
         }
         string guardBombDebugString = "";
@@ -4649,6 +4711,7 @@ namespace BDArmory.Control
             }
 
             //PreviousMissile = CurrentMissile;
+            ++guardMissilesFiredCount; // Lets the parallel salvo tell whether GuardMissileRoutineCore fired.
             UpdateList();
             if (DisengageAfterFiring)
             {
@@ -5003,7 +5066,7 @@ namespace BDArmory.Control
                     hasSingleFired = true;
                 }
 
-                if (vessel.isActiveVessel && weaponIndex != 0)
+                if (vessel.isActiveVessel && weaponIndex != 0 && !parallelSalvoPicking) // Not while the parallel salvo is picking weapons for the secondary targets.
                 {
                     SetDeployableWeapons();
                     DisplaySelectedWeaponMessage();
@@ -7966,8 +8029,11 @@ namespace BDArmory.Control
                 }
 
                 PrepareWeapons();
-                SetDeployableWeapons();
-                DisplaySelectedWeaponMessage();
+                if (!parallelSalvoPicking) // The parallel salvo restores the current target's weapon after picking weapons for the secondary targets, so don't toggle deploy groups or show messages for those.
+                {
+                    SetDeployableWeapons();
+                    DisplaySelectedWeaponMessage();
+                }
                 return true;
             }
             else
@@ -8755,7 +8821,7 @@ namespace BDArmory.Control
             {
                 if (vesselRadarData)
                 {
-                    currTarget = vesselRadarData.detectedRadarTarget(guardTarget, this); //get initial direction for passive sonar torps from passive/non-locking sonar return
+                    currTarget = vesselRadarData.detectedRadarTarget(missileTgt != null ? missileTgt.Vessel : guardTarget, this); //get initial direction for passive sonar torps from passive/non-locking sonar return (of the target being fired at, which isn't the current target for parallel salvos)
                 }
             }
 
@@ -9121,6 +9187,688 @@ namespace BDArmory.Control
             targetScanTimer = 0;
         }
 
+        /// <summary>
+        /// The guard mode launch checks for firing the missile at the target (extracted from GuardMode so that the parallel salvo can apply them to each target):
+        /// launch depth, air-dropped torpedo conditions, terrain, guard angle, dynamic launch zone and unguided range, then (unless the missile is turreted) GetLaunchAuthorization.
+        /// </summary>
+        /// <param name="target">The target.</param>
+        /// <param name="missile">The missile (or a representative missile of the weapon type).</param>
+        /// <param name="unguided">Whether the missile is being used as unguided ordnance (see UnguidedMissile).</param>
+        /// <param name="launchAuthorized">The initial authorization from checks done by the caller. GetLaunchAuthorization is skipped if any check fails.</param>
+        bool GuardMissileLaunchAuthorized(TargetInfo target, MissileBase missile, bool unguided, bool launchAuthorized = true)
+        {
+            if (target == null || missile == null) return false;
+            Vessel targetVessel = target.Vessel;
+            if (targetVessel == null) return false;
+            WeaponClasses weaponClass = missile.GetWeaponClass();
+
+            if (weaponClass == WeaponClasses.Missile && vessel.Splashed && vessel.altitude < -10)
+            {
+                if (BDArmorySettings.DEBUG_MISSILES) Debug.Log("[BDArmory.MissileFire] missile below launch depth");
+                launchAuthorized = false; //submarine below launch depth
+            }
+            Vector3 missileReferencePosition = missile.MissileReferenceTransform.position;
+            if (weaponClass == WeaponClasses.SLW && !vessel.Splashed)
+            {
+                BDModulePilotAI pilotAI = null;
+                BDModuleVTOLAI vtolAI = null;
+                var ai = AI;
+                if (ai != null && ai.pilotEnabled) switch (ai.aiType)
+                    {
+                        case AIType.PilotAI: pilotAI = ai as BDModulePilotAI; break;
+                        case AIType.VTOLAI: vtolAI = ai as BDModuleVTOLAI; break;
+                    }
+                if (pilotAI && vessel.radarAltitude > pilotAI.finalBombingAltitude * 1.2f) launchAuthorized = false; //don't torpedo bomb from high up, the torp's won't survive water impact
+                //if flying with air-drop torps, adjust aimer pos based on predicted water impact point. torps aren't AAMs
+                if (vtolAI && vessel.altitude > 120) launchAuthorized = false;
+                Vector3 torpImpactPos = missileReferencePosition + vessel.srf_vel_direction * (vessel.horizontalSrfSpeed * bombFlightTime); //might need a projectonPlane, check what srf_vel_dir actually outputs - parallel to surface, or vel direction when !orbit
+                missileReferencePosition = torpImpactPos - ((float)FlightGlobals.getAltitudeAtPos(torpImpactPos) * VectorUtils.GetUpDirection(torpImpactPos));
+            }
+            //float targetAngle = VectorUtils.Angle(-transform.forward, guardTarget.transform.position - transform.position);
+            float targetAngle = VectorUtils.Angle(missile.MissileReferenceTransform.forward, targetVessel.CoM - missileReferencePosition);
+            float targetDistance = Vector3.Distance(target.position, missileReferencePosition);
+            if (weaponClass == WeaponClasses.SLW && !vessel.Splashed)
+            {
+                if (targetDistance < vessel.horizontalSrfSpeed * bombFlightTime) launchAuthorized = false; //too close, dropped torp will overshoot
+            }
+            if (missile.GuidanceMode != MissileBase.GuidanceModes.Cruise && missile.GuidanceMode != MissileBase.GuidanceModes.Kappa && missile.GuidanceMode != MissileBase.GuidanceModes.AAMLoft && missile.GuidanceMode != MissileBase.GuidanceModes.AGMBallistic)
+            {
+                if (RadarUtils.TerrainCheck(targetVessel.CoM, missileReferencePosition)) //vessel behind terrain. exception for missiles which can (probably) sort that out
+                {
+                    launchAuthorized = false;
+                    if (BDArmorySettings.DEBUG_MISSILES) Debug.Log($"[BDArmory.MissileFire] target behind terrain, CurrentMissile: {missile.shortName}, GuidanceMode: {missile.GuidanceMode}");
+                }
+            }
+            MissileLaunchParams dlz = MissileLaunchParams.GetDynamicLaunchParams(missile, targetVessel.Velocity(), targetVessel.CoM, -1, unguided); // (CurrentMissile.TargetingMode == MissileBase.TargetingModes.Laser
+                                                                                                                                                 // && BDATargetManager.ActiveLasers.Count <= 0 || CurrentMissile.TargetingMode == MissileBase.TargetingModes.Radar && !_radarsEnabled && !CurrentMissile.radarLOAL));
+            if (targetAngle > guardAngle / 2) //dont fire yet if target out of guard angle
+            {
+                launchAuthorized = false;
+            }
+            else if (targetDistance >= dlz.maxLaunchRange || targetDistance <= dlz.minLaunchRange)  //fire the missile only if target is further than missiles min launch range
+            {
+                launchAuthorized = false;
+            }
+            if (unguided && targetDistance > (missile.GetEngagementRangeMax() / 10) + (weaponClass == WeaponClasses.SLW && !vessel.Splashed ? vessel.horizontalSrfSpeed * bombFlightTime : 0)) launchAuthorized = false; //account for distance covered while dropping torps
+            // Check that launch is possible before entering GuardMissileRoutine, or that missile is on a turret
+            MissileLauncher ml = missile as MissileLauncher;
+            return launchAuthorized && ((ml is not null && (ml.customTurret.Count > 0 || ml.missileTurret || (ml.multiLauncher && ml.multiLauncher.turret))) || GetLaunchAuthorization(targetVessel, this, missile));
+        }
+
+        #region Parallel salvo
+        /// <summary>
+        /// A target in the parallel salvo and the weapon picked for it.
+        /// </summary>
+        struct ParallelSalvoPlan
+        {
+            public TargetInfo target;
+            public MissileBase prototype; // A representative missile of the weapon type picked for the target (any unfired missile of the same type can be used).
+            public string weaponName;
+            public float engageRange;
+            public float engageFOV;
+            public bool unguided;
+            public int slots; // How many missiles to fire at the target in this salvo.
+        }
+
+        /// <summary>
+        /// The weapon selection, so that it can be restored after picking weapons for the secondary targets.
+        /// </summary>
+        struct WeaponSelectionSnapshot
+        {
+            public IBDWeapon weapon;
+            public MissileBase missile;
+            public bool unguided;
+            public string name;
+            public float range;
+            public float fov;
+        }
+
+        readonly List<TargetInfo> parallelTargets = new(16);
+        readonly List<ParallelSalvoPlan> parallelPlans = new(16);
+        readonly List<MissileBase> parallelCandidates = new(32); // Unfired missiles of the weapon type of the current plan.
+        string parallelCandidatesName = null;
+        float parallelCandidatesRange = -1f;
+        float parallelCandidatesFOV = -1f;
+        readonly HashSet<MissileBase> parallelTried = new(); // Missiles that couldn't be fired at the current plan's target.
+        readonly Dictionary<UnityEngine.Object, int> parallelRailUse = new(); // Launches per rail/tube/launcher in this salvo, to spread the launches over the rails.
+        readonly HashSet<UnityEngine.Object> parallelRailsThisFrame = new(); // Rails/tubes/launchers that have launched in this physics frame.
+        bool parallelSalvoPicking = false; // Suppresses the selected weapon message and weapon deploy action groups while picking weapons for the secondary targets.
+        int guardMissilesFiredCount = 0; // Incremented whenever FireCurrentMissile or FireParallelMissile fires a missile.
+        static readonly WaitForFixedUpdate parallelWaitForFixedUpdate = new();
+        const int parallelMaxPicksPerFrame = 32; // Weapon selections (SmartPickWeapon) for the secondary targets per frame.
+        const int parallelMaxLaunchesPerFrame = 4; // Launches per frame with a stagger of 0.
+        const int parallelMaxAttemptsPerFrame = 16; // Launch attempts (clearance raycasts, seeker scans) per frame.
+        const int parallelMaxHeatLockFailures = 3; // Missiles to try before giving up on getting a heat lock on a target.
+        const int parallelMaxPlanIdleFrames = 15; // Frames without a launch before moving on to the next target (rails not ready, etc.).
+        const int parallelMaxIdleFrames = 50; // Frames without a launch before giving up on the salvo.
+
+        bool ParallelSalvoActive => guardMode && vessel != null && vessel.gameObject.activeInHierarchy && !BDArmorySettings.PEACE_MODE;
+        static bool ParallelTargetValid(TargetInfo target) => target != null && target.Vessel != null && !target.Vessel.packed;
+
+        /// <summary>
+        /// Fire missiles in parallel: each Firing Interval, fire up to parallelSalvoSize missiles at the current target and at each secondary missile target, up to Max Missile Tgts engaged targets.
+        /// Missiles/Target (counting missiles away and queued launches) is respected for each target.
+        ///
+        /// 1. Batch formation: pick the weapon for each target (SmartPickWeapon_EngagementEnvelope, as for the current target), check the launch authorization and request the radar locks needed
+        ///    (SARH, and GPS without a GPS target) for all the targets, then wait one frame for the locks to register.
+        /// 2. Launch: for each target, fire missiles of the picked type, spreading the launches over the rails/tubes/cells, with a stagger of parallelSalvoStagger frames between launches.
+        ///    Heat seekers get a heat lock for each missile, SARH missiles use the radar lock on their target, fire-and-forget active radar missiles within seeker range and
+        ///    GPS/inertial missiles go immediately. Turreted, laser and anti-radiation missiles (and GPS missiles without coordinates) go through GuardMissileRoutineCore one at a time.
+        /// One coroutine handles the whole salvo, yielding between launches, so the per-frame work is bounded.
+        /// </summary>
+        IEnumerator GuardParallelSalvoRoutine()
+        {
+            if (guardFiringMissile) yield break;
+            guardFiringMissile = true;
+            int launchesThisSalvo = 0;
+            var primarySelection = SnapshotWeaponSelection();
+            TargetInfo primaryTarget = currentTarget;
+            try
+            {
+                // 1. Batch formation.
+                parallelTargets.Clear();
+                parallelPlans.Clear();
+                if (ParallelTargetValid(primaryTarget)) parallelTargets.Add(primaryTarget);
+                for (int i = 0; i < targetsAssigned.Count; ++i) // The secondary targets (targetsAssigned[0] is the current target if it's a vessel).
+                {
+                    var t = targetsAssigned[i];
+                    if (t != primaryTarget && ParallelTargetValid(t)) parallelTargets.Add(t);
+                }
+                int maxPerTarget = Mathf.Clamp(Mathf.RoundToInt(maxMissilesOnTarget), 1, (int)maxAllowableMissilesOnTarget);
+                int salvoSize = Mathf.Clamp(Mathf.RoundToInt(parallelSalvoSize), 1, maxPerTarget);
+                int maxEngaged = Mathf.Clamp(Mathf.RoundToInt(multiMissileTgtNum), 1, (int)maxAllowableTargets);
+                int engaged = engagedTargets;
+                int lockCapacity = vesselRadarData ? EffectiveMaxRadarLocks + vesselRadarData.MaxRadarLocksExternal : 0;
+                int locksUsed = vesselRadarData ? vesselRadarData.numLockedTargets : 0;
+                bool waitForRadarLocks = false;
+                int picksThisFrame = 0;
+
+                for (int i = 0; i < parallelTargets.Count; ++i)
+                {
+                    var target = parallelTargets[i];
+                    if (!ParallelTargetValid(target)) continue;
+                    int away = GetMissilesAway(target).numAway;
+                    if (away >= maxPerTarget) continue; // Saturated.
+                    bool newTarget = away <= 0;
+                    if (newTarget && engaged >= maxEngaged) continue; // Already engaging the max number of targets.
+
+                    MissileBase prototype;
+                    bool unguided;
+                    if (target == primaryTarget) // Use the weapon already picked for the current target.
+                    {
+                        if (primarySelection.weapon == null) continue;
+                        var weaponClass = primarySelection.weapon.GetWeaponClass();
+                        if (weaponClass != WeaponClasses.Missile && weaponClass != WeaponClasses.SLW) continue;
+                        prototype = primarySelection.missile;
+                        if (prototype == null || prototype.launched || prototype.HasFired) prototype = FindParallelPrototype(primarySelection.name, primarySelection.range, primarySelection.fov);
+                        unguided = primarySelection.unguided;
+                    }
+                    else // Pick the weapon for the secondary target as for the current target.
+                    {
+                        if (picksThisFrame >= parallelMaxPicksPerFrame)
+                        {
+                            RestoreWeaponSelection(primarySelection); // Keep the current target's weapon selected for the AI while waiting.
+                            yield return parallelWaitForFixedUpdate;
+                            picksThisFrame = 0;
+                            if (!ParallelSalvoActive) yield break;
+                            if (!ParallelTargetValid(target)) continue;
+                        }
+                        ++picksThisFrame;
+                        bool picked;
+                        parallelSalvoPicking = true;
+                        try { picked = SmartPickWeapon_EngagementEnvelope(target); }
+                        finally { parallelSalvoPicking = false; }
+                        if (!picked || selectedWeapon == null) continue;
+                        var weaponClass = selectedWeapon.GetWeaponClass();
+                        if (weaponClass != WeaponClasses.Missile && weaponClass != WeaponClasses.SLW) continue; // Guns, rockets, bombs, etc. are handled by the normal guard routines.
+                        prototype = CurrentMissile;
+                        if (prototype == null || prototype.launched || prototype.HasFired) prototype = FindParallelPrototype(selectedWeapon.GetShortName(), selectedWeapon.GetEngageRange(), selectedWeapon.GetEngageFOV());
+                        unguided = unguidedWeapon;
+                    }
+                    if (prototype == null) continue;
+                    if (!GuardMissileLaunchAuthorized(target, prototype, unguided)) continue;
+
+                    // Radar locks: SARH missiles need a lock on their target, GPS missiles can get coordinates from one and uncaged heat seekers are pointed at the target with one.
+                    // Check the lock capacity first so that new locks don't replace locks that are guiding missiles.
+                    Vessel targetVessel = target.Vessel;
+                    bool wantsLock = false;
+                    if (!unguided)
+                        switch (prototype.TargetingMode)
+                        {
+                            case MissileBase.TargetingModes.Radar: wantsLock = true; break;
+                            case MissileBase.TargetingModes.Gps: wantsLock = !ParallelGPSDatabaseHasTarget(targetVessel); break;
+                            case MissileBase.TargetingModes.Heat: wantsLock = prototype.uncagedLock && prototype.GuidanceMode != MissileBase.GuidanceModes.SLW; break;
+                        }
+                    bool locked = wantsLock && ParallelRadarLocked(targetVessel);
+                    if (wantsLock && !locked && vesselRadarData && (prototype.GetWeaponClass() == WeaponClasses.SLW ? _sonarsEnabled : _radarsEnabled) && locksUsed < lockCapacity)
+                    {
+                        if (vesselRadarData.TryLockTarget(targetVessel))
+                        {
+                            ++locksUsed;
+                            locked = true;
+                            waitForRadarLocks = true;
+                        }
+                    }
+                    if (!unguided && prototype.TargetingMode == MissileBase.TargetingModes.Radar && !locked && !ParallelActiveSeekerCanAcquire(prototype, targetVessel))
+                    {
+                        if (BDArmorySettings.DEBUG_MISSILES) Debug.Log($"[BDArmory.MissileFire]: {vessel.vesselName} parallel salvo: no radar lock available for {targetVessel.vesselName}, skipping.");
+                        continue; // No lock slot for the SARH missile and the target isn't within active seeker range.
+                    }
+
+                    parallelPlans.Add(new ParallelSalvoPlan
+                    {
+                        target = target,
+                        prototype = prototype,
+                        weaponName = prototype.GetShortName(),
+                        engageRange = prototype.GetEngageRange(),
+                        engageFOV = prototype.GetEngageFOV(),
+                        unguided = unguided,
+                        slots = Mathf.Min(salvoSize, maxPerTarget - Mathf.Max(away, 0))
+                    });
+                    if (newTarget) ++engaged;
+                }
+                RestoreWeaponSelection(primarySelection);
+                if (parallelPlans.Count == 0) yield break;
+                if (BDArmorySettings.DEBUG_MISSILES) Debug.Log($"[BDArmory.MissileFire]: {vessel.vesselName} parallel salvo against {parallelPlans.Count} targets.");
+                if (waitForRadarLocks) yield return parallelWaitForFixedUpdate; // The radar locks show up in GetLockedTargets once the radars have updated.
+                if (SetCargoBays()) yield return new WaitForSecondsFixed(2f); // Bays containing the current missile type.
+                if (!ParallelSalvoActive) yield break;
+
+                // 2. Launch.
+                int stagger = Mathf.Clamp(Mathf.RoundToInt(parallelSalvoStagger), 0, (int)maxParallelSalvoStagger);
+                int maxLaunchesPerFrame = stagger > 0 ? 1 : parallelMaxLaunchesPerFrame;
+                int launchesThisFrame = 0, attemptsThisFrame = 0, salvoIdleFrames = 0;
+                parallelRailUse.Clear();
+                parallelRailsThisFrame.Clear();
+                parallelCandidatesName = null;
+                for (int p = 0; p < parallelPlans.Count; ++p)
+                {
+                    var plan = parallelPlans[p];
+                    int fired = 0, heatFailures = 0, idleFrames = 0;
+                    parallelTried.Clear();
+                    BuildParallelCandidates(plan.weaponName, plan.engageRange, plan.engageFOV);
+                    while (fired < plan.slots)
+                    {
+                        if (!ParallelSalvoActive) yield break;
+                        if (!ParallelTargetValid(plan.target)) break;
+                        if (launchesThisFrame >= maxLaunchesPerFrame || attemptsThisFrame >= parallelMaxAttemptsPerFrame)
+                        {
+                            if (launchesThisFrame == 0) // Waiting for rails (rotating/deploying) or for rails that launched this frame.
+                            {
+                                if (++salvoIdleFrames > parallelMaxIdleFrames) yield break; // Nothing has launched for a while, give up on this salvo.
+                                if (++idleFrames > parallelMaxPlanIdleFrames) break; // Move on to the next target.
+                            }
+                            yield return parallelWaitForFixedUpdate;
+                            launchesThisFrame = 0; attemptsThisFrame = 0;
+                            parallelRailsThisFrame.Clear();
+                            continue;
+                        }
+                        var ml = PickParallelCandidate(out bool blockedThisFrame);
+                        if (ml == null)
+                        {
+                            if (!blockedThisFrame) break; // Out of missiles of this type for this target.
+                            attemptsThisFrame = parallelMaxAttemptsPerFrame; // The remaining missiles are on rails that launched this frame, try them next frame.
+                            continue;
+                        }
+                        ++attemptsThisFrame;
+                        if (ParallelNeedsCoreRoutine(ml, plan))
+                        {
+                            // Turrets need aiming, laser and anti-radiation missiles need their seekers on the target, GPS missiles without coordinates need a targeting pod:
+                            // use the standard guard routine for this missile.
+                            int firedBefore = guardMissilesFiredCount;
+                            var core = GuardMissileRoutineCore(plan.target, ml);
+                            while (core.MoveNext()) yield return core.Current;
+                            currFiringMissile = null;
+                            currFiringTarget = null;
+                            launchesThisFrame = 0; attemptsThisFrame = 0;
+                            parallelRailsThisFrame.Clear();
+                            if (guardMissilesFiredCount == firedBefore) break; // Couldn't fire at this target, don't retry with more missiles.
+                            int count = ParallelLaunchCount(ml);
+                            fired += count;
+                            launchesThisSalvo += count;
+                            idleFrames = 0;
+                            salvoIdleFrames = 0;
+                            continue;
+                        }
+                        int launched = TryParallelInstantLaunch(ml, plan, ref heatFailures);
+                        if (launched > 0)
+                        {
+                            fired += launched;
+                            launchesThisSalvo += launched;
+                            ++launchesThisFrame;
+                            idleFrames = 0;
+                            salvoIdleFrames = 0;
+                            var rail = ParallelRailKey(ml);
+                            parallelRailsThisFrame.Add(rail);
+                            parallelRailUse[rail] = parallelRailUse.TryGetValue(rail, out int uses) ? uses + 1 : 1;
+                            for (int s = 0; s < stagger; ++s) yield return parallelWaitForFixedUpdate;
+                            if (stagger > 0)
+                            {
+                                launchesThisFrame = 0; attemptsThisFrame = 0;
+                                parallelRailsThisFrame.Clear();
+                            }
+                        }
+                        else if (launched < 0) // The rail isn't ready yet (rotating/deploying): try its missiles again next frame.
+                        {
+                            parallelRailsThisFrame.Add(ParallelRailKey(ml));
+                        }
+                        else
+                        {
+                            parallelTried.Add(ml);
+                            if (heatFailures >= parallelMaxHeatLockFailures) break; // Can't get a heat lock on this target.
+                        }
+                    }
+                    if (BDArmorySettings.DEBUG_MISSILES) Debug.Log($"[BDArmory.MissileFire]: {vessel.vesselName} parallel salvo fired {fired}/{plan.slots} {plan.weaponName} at {(plan.target != null && plan.target.Vessel != null ? plan.target.Vessel.vesselName : "dead target")}.");
+                }
+            }
+            finally
+            {
+                parallelSalvoPicking = false;
+                currFiringMissile = null;
+                currFiringTarget = null;
+                parallelTargets.Clear();
+                parallelPlans.Clear();
+                parallelCandidates.Clear();
+                parallelCandidatesName = null;
+                parallelTried.Clear();
+                parallelRailUse.Clear();
+                parallelRailsThisFrame.Clear();
+                if (vessel != null)
+                {
+                    if (launchesThisSalvo > 0) UpdateList(); // Once for the salvo instead of after each launch.
+                    RestoreWeaponSelection(primarySelection);
+                }
+                guardFiringMissile = false;
+            }
+        }
+
+        WeaponSelectionSnapshot SnapshotWeaponSelection()
+        {
+            var weapon = selectedWeapon;
+            return new WeaponSelectionSnapshot
+            {
+                weapon = weapon,
+                missile = CurrentMissile,
+                unguided = unguidedWeapon,
+                name = weapon != null ? weapon.GetShortName() : null,
+                range = weapon != null ? weapon.GetEngageRange() : -1f,
+                fov = weapon != null ? weapon.GetEngageFOV() : -1f
+            };
+        }
+
+        /// <summary>
+        /// Restore the weapon selection (e.g., the current target's weapon after picking weapons for the secondary targets).
+        /// The weapon list may have changed since the snapshot (missiles fired), so the weapon is found again by name, range and FOV.
+        /// </summary>
+        void RestoreWeaponSelection(WeaponSelectionSnapshot snapshot)
+        {
+            if (vessel == null || weaponArray == null) return;
+            parallelSalvoPicking = true; // No selection message or deploy action groups for restoring the selection.
+            try
+            {
+                int index = 0;
+                if (snapshot.name != null)
+                    for (int i = 1; i < weaponArray.Length; ++i)
+                    {
+                        var w = weaponArray[i];
+                        if (w == null) continue;
+                        if (w.GetShortName() == snapshot.name && w.GetEngageRange() == snapshot.range && w.GetEngageFOV() == snapshot.fov) { index = i; break; }
+                    }
+                if (index == 0)
+                {
+                    if (snapshot.name == null) // Nothing was selected.
+                    {
+                        weaponIndex = 0;
+                        selectedWeapon = null;
+                    }
+                    return; // The weapon is no longer available, the next target scan will pick another.
+                }
+                weaponIndex = index;
+                var weaponObject = snapshot.weapon as UnityEngine.Object;
+                selectedWeapon = (weaponObject != null && snapshot.weapon.GetPart() != null && snapshot.weapon.GetPart().vessel == vessel) ? snapshot.weapon : weaponArray[index];
+                if (snapshot.missile != null && !snapshot.missile.launched && !snapshot.missile.HasFired && snapshot.missile.vessel == vessel) CurrentMissile = snapshot.missile;
+                UpdateSelectedWeaponState(); // Finds another missile of the type if the snapshot missile has been fired.
+                unguidedWeapon = snapshot.unguided;
+            }
+            finally { parallelSalvoPicking = false; }
+        }
+
+        /// <summary>
+        /// Find an unfired missile of the weapon type.
+        /// </summary>
+        MissileBase FindParallelPrototype(string weaponName, float engageRange, float engageFOV)
+        {
+            if (weaponName == null) return null;
+            foreach (var missile in VesselModuleRegistry.GetModules<MissileBase>(vessel))
+            {
+                if (missile == null || missile.launched || missile.HasFired) continue;
+                if (missile.GetWeaponChannel() > weaponChannel) continue;
+                if (missile.GetShortName() != weaponName || missile.GetEngageRange() != engageRange || missile.GetEngageFOV() != engageFOV) continue;
+                return missile;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Gather the unfired missiles of the weapon type (same weapon group as FireCurrentMissile's fallback: name, max range and FOV).
+        /// The list is kept between targets that use the same weapon type, launched missiles are skipped when picking.
+        /// </summary>
+        void BuildParallelCandidates(string weaponName, float engageRange, float engageFOV)
+        {
+            if (weaponName == parallelCandidatesName && engageRange == parallelCandidatesRange && engageFOV == parallelCandidatesFOV) return;
+            parallelCandidatesName = weaponName;
+            parallelCandidatesRange = engageRange;
+            parallelCandidatesFOV = engageFOV;
+            parallelCandidates.Clear();
+            foreach (var missile in VesselModuleRegistry.GetModules<MissileBase>(vessel))
+            {
+                if (missile == null || missile.launched || missile.HasFired) continue;
+                if (missile.GetWeaponChannel() > weaponChannel) continue;
+                if (missile.GetShortName() != weaponName || missile.GetEngageRange() != engageRange || missile.GetEngageFOV() != engageFOV) continue;
+                parallelCandidates.Add(missile);
+            }
+        }
+
+        /// <summary>
+        /// Pick the next missile to fire: the least used rail/tube/launcher in this salvo, skipping rails that have launched this frame and missiles already tried for this target.
+        /// </summary>
+        /// <param name="blockedThisFrame">Whether there are missiles left that are only blocked by their rail having launched this frame.</param>
+        MissileBase PickParallelCandidate(out bool blockedThisFrame)
+        {
+            blockedThisFrame = false;
+            int best = -1;
+            int bestUses = int.MaxValue;
+            for (int i = parallelCandidates.Count - 1; i >= 0; --i)
+            {
+                var missile = parallelCandidates[i];
+                if (missile == null || missile.launched || missile.HasFired || missile.vessel != vessel) // Fired (or gone): swap-remove it.
+                {
+                    int last = parallelCandidates.Count - 1;
+                    parallelCandidates[i] = parallelCandidates[last];
+                    parallelCandidates.RemoveAt(last);
+                    if (best == last) best = i;
+                    continue;
+                }
+                if (parallelTried.Contains(missile)) continue;
+                if (missile is MissileLauncher launcher && launcher.rotaryRail && launcher.rotaryRail.readyMissile != launcher) { blockedThisFrame = true; continue; } // Only the rotary rail's ready missile can fire, the others come round later.
+                var rail = ParallelRailKey(missile);
+                if (parallelRailsThisFrame.Contains(rail)) { blockedThisFrame = true; continue; }
+                int uses = parallelRailUse.TryGetValue(rail, out int u) ? u : 0;
+                if (uses < bestUses) { best = i; bestUses = uses; }
+            }
+            return best >= 0 ? parallelCandidates[best] : null;
+        }
+
+        /// <summary>
+        /// The rail, tube or launcher the missile is fired from. Missiles on the same rotary/deployable rail or turret share it; other missiles (including reloadable rails, VLS cells and multi-missile launchers) are their own.
+        /// </summary>
+        static UnityEngine.Object ParallelRailKey(MissileBase missile)
+        {
+            if (missile is MissileLauncher launcher)
+            {
+                if (launcher.rotaryRail) return launcher.rotaryRail;
+                if (launcher.deployableRail) return launcher.deployableRail;
+                if (launcher.missileTurret) return launcher.missileTurret;
+                if (launcher.multiLauncher && launcher.multiLauncher.turret) return launcher.multiLauncher.turret;
+            }
+            return missile.part;
+        }
+
+        /// <summary>
+        /// How many missiles a launch counts as towards the salvo: a multi-missile launcher fires its whole salvo.
+        /// </summary>
+        static int ParallelLaunchCount(MissileBase missile)
+        {
+            if (missile is MissileLauncher launcher && launcher.multiLauncher && launcher.multiLauncher.isMultiLauncher)
+                return Mathf.Max(1, Mathf.RoundToInt(launcher.multiLauncher.salvoSize));
+            return 1;
+        }
+
+        /// <summary>
+        /// Missiles that can't be fired instantly and go through GuardMissileRoutineCore.
+        /// </summary>
+        bool ParallelNeedsCoreRoutine(MissileBase missile, ParallelSalvoPlan plan)
+        {
+            if (missile.HasTurrets()) return true; // Missile turrets, custom turrets and multi-missile launcher turrets need aiming.
+            if (plan.unguided || missile.TargetingMode == MissileBase.TargetingModes.None) return false;
+            return missile.TargetingMode switch
+            {
+                MissileBase.TargetingModes.Laser => true, // Needs a targeting pod or an allied laser on the target.
+                MissileBase.TargetingModes.AntiRad => true, // Needs the RWR to pick up the target's radar.
+                MissileBase.TargetingModes.Gps => !ParallelGPSDatabaseHasTarget(plan.target.Vessel) && !ParallelRadarLocked(plan.target.Vessel), // Needs a targeting pod for coordinates.
+                _ => false
+            };
+        }
+
+        /// <summary>
+        /// Whether the vessel's radars have a lock on the target.
+        /// </summary>
+        bool ParallelRadarLocked(Vessel targetVessel)
+        {
+            if (targetVessel == null || !vesselRadarData || !vesselRadarData.locked) return false;
+            var lockedTargets = vesselRadarData.GetLockedTargets();
+            for (int i = 0; i < lockedTargets.Count; ++i)
+                if (lockedTargets[i].vessel == targetVessel) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// Whether the missile's active radar seeker can acquire the target directly at launch (fire-and-forget, as for retargeting).
+        /// </summary>
+        static bool ParallelActiveSeekerCanAcquire(MissileBase missile, Vessel targetVessel)
+        {
+            if (missile.activeRadarRange <= 0f || targetVessel == null) return false;
+            Vector3 relPos = targetVessel.CoM - missile.MissileReferenceTransform.position;
+            return relPos.sqrMagnitude < missile.activeRadarRange * missile.activeRadarRange && VectorUtils.Angle(missile.GetForwardTransform(), relPos) < missile.maxOffBoresight * 0.75f;
+        }
+
+        /// <summary>
+        /// Whether there's an entry in the team's GPS target database for the target (as GuardMissileRoutineCore).
+        /// </summary>
+        bool ParallelGPSDatabaseHasTarget(Vessel targetVessel)
+        {
+            if (targetVessel == null) return false;
+            var gpsTargets = BDATargetManager.GPSTargetList(Team);
+            for (int i = 0; i < gpsTargets.Count; ++i)
+                if ((gpsTargets[i].worldPos - targetVessel.CoM).sqrMagnitude <= 100) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// Whether the vessel's sensors can provide inertial guidance data for the target (as GuardMissileRoutineCore).
+        /// </summary>
+        bool ParallelINSTarget(MissileBase missile, Vessel targetVessel)
+        {
+            if (!vesselRadarData || targetVessel == null) return false;
+            TargetSignatureData insTarget = TargetSignatureData.noTarget;
+            if (missile.GetWeaponClass() == WeaponClasses.SLW)
+            {
+                if (_sonarsEnabled) insTarget = vesselRadarData.detectedRadarTarget(targetVessel, this);
+            }
+            else
+            {
+                if (_radarsEnabled) insTarget = vesselRadarData.detectedRadarTarget(targetVessel, this);
+                if (!insTarget.exists && _irstsEnabled) insTarget = vesselRadarData.activeIRTarget(targetVessel, this, true);
+            }
+            return insTarget.exists && insTarget.vessel == targetVessel;
+        }
+
+        /// <summary>
+        /// Try to fire the missile at the plan's target right now.
+        /// </summary>
+        /// <returns>The number of missiles launched (a multi-missile launcher counts as its salvo size), 0 if the missile couldn't be fired, -1 if its rail isn't ready yet.</returns>
+        int TryParallelInstantLaunch(MissileBase missile, ParallelSalvoPlan plan, ref int heatFailures)
+        {
+            if (missile.launched || missile.HasFired) return 0;
+            Vessel targetVessel = plan.target.Vessel;
+            var launcher = missile as MissileLauncher;
+            // Rail readiness and clearance for this missile (FireCurrentMissile is not used with clearance checks, as its fallback switches the selected weapon).
+            if (launcher != null)
+            {
+                if (launcher.rotaryRail && (!launcher.rotaryRail.readyToFire || launcher.rotaryRail.readyMissile != launcher)) return -1;
+                if (launcher.deployableRail && !launcher.deployableRail.readyToFire) return -1;
+            }
+            if (!CheckBombClearance(missile)) return 0;
+            if (!GetLaunchAuthorization(targetVessel, this, missile)) return 0; // Boresight, DLZ, friendly fire for this missile.
+
+            currFiringMissile = missile;
+            currFiringTarget = plan.target;
+            TargetData targetData = null;
+            if (plan.unguided || missile.TargetingMode == MissileBase.TargetingModes.None)
+            {
+                // Unguided: only within the dumbfire range (as GuardMissileRoutineCore).
+                if (launcher != null && launcher.multiLauncher && launcher.multiLauncher.overrideReferenceTransform) return 0;
+                if (missile.TargetingMode != MissileBase.TargetingModes.None &&
+                    (targetVessel.CoM - missile.vessel.CoM).sqrMagnitude >= (missile.GetWeaponClass() == WeaponClasses.SLW && !vessel.Splashed ? (missile.maxStaticLaunchRange * missile.maxStaticLaunchRange) / 4 + vessel.horizontalSrfSpeed * bombFlightTime : (0.01f * missile.maxStaticLaunchRange * missile.maxStaticLaunchRange)))
+                    return 0;
+            }
+            else
+            {
+                switch (missile.TargetingMode)
+                {
+                    case MissileBase.TargetingModes.Heat:
+                        {
+                            heatTarget = TargetSignatureData.noTarget; // Don't let the seeker be pointed at the previous target.
+                            SearchForHeatTarget(missile, plan.target);
+                            bool lockedOn = heatTarget.exists && heatTarget.vessel == targetVessel;
+                            if (lockedOn && heatTarget.signalStrength * ((BDArmorySettings.ASPECTED_IR_SEEKERS && Vector3.Dot(targetVessel.vesselTransform ? targetVessel.vesselTransform.up : targetVessel.transform.up, missile.transform.forward) > 0.25f) ? missile.frontAspectHeatModifier : 1) < missile.heatThreshold)
+                                lockedOn = false; // Heat threshold not met.
+                            if (!lockedOn)
+                            {
+                                heatTarget = TargetSignatureData.noTarget;
+                                ++heatFailures;
+                                return 0;
+                            }
+                            break;
+                        }
+                    case MissileBase.TargetingModes.Radar:
+                        {
+                            if (!ParallelRadarLocked(targetVessel))
+                            {
+                                if (!ParallelActiveSeekerCanAcquire(missile, targetVessel)) return 0;
+                                // Fire-and-forget: the active seeker acquires the target directly (SendTargetDataToMissile only replaces this with a radar lock on the target).
+                                missile.radarTarget = new TargetSignatureData(targetVessel, 0f);
+                                missile.targetVessel = plan.target;
+                            }
+                            break;
+                        }
+                    case MissileBase.TargetingModes.Gps:
+                        {
+                            if (!ParallelGPSDatabaseHasTarget(targetVessel) && !ParallelRadarLocked(targetVessel)) return 0;
+                            designatedGPSInfo = new GPSTargetInfo(VectorUtils.WorldPositionToGeoCoords(targetVessel.CoM, vessel.mainBody), targetVessel.vesselName.Substring(0, Mathf.Min(12, targetVessel.vesselName.Length)));
+                            targetData = new TargetData(designatedGPSCoords);
+                            break;
+                        }
+                    case MissileBase.TargetingModes.Inertial:
+                        {
+                            if (!ParallelINSTarget(missile, targetVessel)) return 0;
+                            targetData = new TargetData(VectorUtils.WorldPositionToGeoCoords(MissileGuidance.GetAirToAirFireSolution(missile, targetVessel, out float insTimeToGo), targetVessel.mainBody), Time.time, insTimeToGo);
+                            break;
+                        }
+                    default:
+                        return 0; // Laser and anti-radiation missiles go through GuardMissileRoutineCore.
+                }
+            }
+
+            int count = ParallelLaunchCount(missile);
+            FireParallelMissile(missile, targetVessel, targetData);
+            if (!missile.launched && !missile.HasFired) // The rail or turret didn't fire it.
+            {
+                if (missile.TargetingMode == MissileBase.TargetingModes.Heat) heatTarget = TargetSignatureData.noTarget;
+                return 0;
+            }
+            if (BDArmorySettings.DEBUG_MISSILES) Debug.Log($"[BDArmory.MissileFire]: {vessel.vesselName} parallel salvo fired {missile.shortName} ({missile.TargetingMode}) at {targetVessel.vesselName}.");
+            return count;
+        }
+
+        /// <summary>
+        /// Fire the missile at the target without FireCurrentMissile's clearance fallback (which can switch to a different missile and changes the selected weapon)
+        /// and without updating the weapon list after each launch (done once at the end of the salvo). Rails and turrets fire through their own FireMissile.
+        /// </summary>
+        void FireParallelMissile(MissileBase missile, Vessel targetVessel, TargetData targetData)
+        {
+            if (missile.warheadType == MissileBase.WarheadTypes.EMP || missile.warheadType == MissileBase.WarheadTypes.Nuke)
+            {
+                FireCurrentMissile(missile, false, targetVessel, targetData); // Handles withdrawing from the blast radius.
+                return;
+            }
+            var launcher = missile as MissileLauncher;
+            if (launcher != null && launcher.missileTurret)
+                launcher.missileTurret.FireMissile(launcher, targetVessel, targetData);
+            else if (launcher != null && launcher.rotaryRail)
+                launcher.rotaryRail.FireMissile(launcher, targetVessel, targetData);
+            else if (launcher != null && launcher.deployableRail)
+                launcher.deployableRail.FireMissile(launcher, targetVessel, targetData);
+            else
+            {
+                SendTargetDataToMissile(missile, targetVessel, true, targetData, targetVessel == null);
+                missile.FireMissile();
+                PreviousMissile = missile;
+            }
+            if (missile.launched || missile.HasFired) ++guardMissilesFiredCount;
+        }
+        #endregion Parallel salvo
+
         void GuardMode()
         {
             if (BDArmorySettings.PEACE_MODE) return;
@@ -9208,64 +9956,21 @@ namespace BDArmory.Control
                     {
                         if (selectedWeapon.GetWeaponClass() == WeaponClasses.Missile || selectedWeapon.GetWeaponClass() == WeaponClasses.SLW)
                         {
-                            if (CurrentMissile != null) // Reloadable rails can give a null missile.
+                            if (parallelFire)
                             {
-                                bool launchAuthorized = true;
+                                // Parallel salvo: fire up to parallelSalvoSize missiles at the current target and at each secondary missile target in one batch.
+                                // The batch finds its own missiles, so a null CurrentMissile (reloadable rails) is fine here.
+                                if (BDArmorySettings.DEBUG_MISSILES) Debug.Log($"[BDArmory.MissileFire]: {vessel.vesselName} starting parallel salvo; salvo size: {parallelSalvoSize}, missiles/target: {maxMissilesOnTarget}, max missile targets: {multiMissileTgtNum}");
+                                StartCoroutine(GuardParallelSalvoRoutine());
+                            }
+                            else if (CurrentMissile != null) // Reloadable rails can give a null missile.
+                            {
                                 bool pilotAuthorized = true;
                                 //(!pilotAI || pilotAI.GetLaunchAuthorization(guardTarget, this));
 
-                                if (selectedWeapon.GetWeaponClass() == WeaponClasses.Missile && vessel.Splashed && vessel.altitude < -10)
-                                {
-                                    if (BDArmorySettings.DEBUG_MISSILES) Debug.Log("[BDArmory.MissileFire] missile below launch depth");
-                                    launchAuthorized = false; //submarine below launch depth
-                                }
-                                Vector3 missileReferencePosition = CurrentMissile.MissileReferenceTransform.position;
-                                if (selectedWeapon.GetWeaponClass() == WeaponClasses.SLW && !vessel.Splashed)
-                                {
-                                    BDModulePilotAI pilotAI = null;
-                                    BDModuleVTOLAI vtolAI = null;
-                                    var ai = AI;
-                                    if (ai != null && ai.pilotEnabled) switch (ai.aiType)
-                                        {
-                                            case AIType.PilotAI: pilotAI = ai as BDModulePilotAI; break;
-                                            case AIType.VTOLAI: vtolAI = ai as BDModuleVTOLAI; break;
-                                        }
-                                    if (pilotAI && vessel.radarAltitude > pilotAI.finalBombingAltitude * 1.2f) launchAuthorized = false; //don't torpedo bomb from high up, the torp's won't survive water impact
-                                    //if flying with air-drop torps, adjust aimer pos based on predicted water impact point. torps aren't AAMs
-                                    if (vtolAI && vessel.altitude > 120) launchAuthorized = false;
-                                    Vector3 torpImpactPos = missileReferencePosition + vessel.srf_vel_direction * (vessel.horizontalSrfSpeed * bombFlightTime); //might need a projectonPlane, check what srf_vel_dir actually outputs - parallel to surface, or vel direction when !orbit
-                                    missileReferencePosition = torpImpactPos - ((float)FlightGlobals.getAltitudeAtPos(torpImpactPos) * VectorUtils.GetUpDirection(torpImpactPos));
-                                }
-                                //float targetAngle = VectorUtils.Angle(-transform.forward, guardTarget.transform.position - transform.position);
-                                float targetAngle = VectorUtils.Angle(CurrentMissile.MissileReferenceTransform.forward, guardTarget.CoM - missileReferencePosition);
-                                float targetDistance = Vector3.Distance(currentTarget.position, missileReferencePosition);
-                                if (selectedWeapon.GetWeaponClass() == WeaponClasses.SLW && !vessel.Splashed)
-                                {
-                                    if (targetDistance < vessel.horizontalSrfSpeed * bombFlightTime) launchAuthorized = false; //too close, dropped torp will overshoot
-                                }
-                                if (CurrentMissile.GuidanceMode != MissileBase.GuidanceModes.Cruise && CurrentMissile.GuidanceMode != MissileBase.GuidanceModes.Kappa && CurrentMissile.GuidanceMode != MissileBase.GuidanceModes.AAMLoft && CurrentMissile.GuidanceMode != MissileBase.GuidanceModes.AGMBallistic)
-                                {
-                                    if (RadarUtils.TerrainCheck(guardTarget.CoM, missileReferencePosition)) //vessel behind terrain. exception for missiles which can (probably) sort that out
-                                    {
-                                        launchAuthorized = false;
-                                        if (BDArmorySettings.DEBUG_MISSILES) Debug.Log($"[BDArmory.MissileFire] target behind terrain, CurrentMissile: {CurrentMissile.shortName}, GuidanceMode: {CurrentMissile.GuidanceMode}");
-                                    }
-                                }
-                                MissileLaunchParams dlz = MissileLaunchParams.GetDynamicLaunchParams(CurrentMissile, guardTarget.Velocity(), guardTarget.CoM, -1, unguidedWeapon); // (CurrentMissile.TargetingMode == MissileBase.TargetingModes.Laser
-                                                                                                                                                                                   // && BDATargetManager.ActiveLasers.Count <= 0 || CurrentMissile.TargetingMode == MissileBase.TargetingModes.Radar && !_radarsEnabled && !CurrentMissile.radarLOAL));
-                                if (targetAngle > guardAngle / 2) //dont fire yet if target out of guard angle
-                                {
-                                    launchAuthorized = false;
-                                }
-                                else if (targetDistance >= dlz.maxLaunchRange || targetDistance <= dlz.minLaunchRange)  //fire the missile only if target is further than missiles min launch range
-                                {
-                                    launchAuthorized = false;
-                                }
-                                if (unguidedWeapon && targetDistance > (CurrentMissile.GetEngagementRangeMax() / 10) + (CurrentMissile.GetWeaponClass() == WeaponClasses.SLW && !vessel.Splashed ? vessel.horizontalSrfSpeed * bombFlightTime : 0)) launchAuthorized = false; //account for distance covered while dropping torps
-                                if (engagedTargets >= multiMissileTgtNum && firedMissiles <= 0) launchAuthorized = false; //already fired on max allowed targets (was 'engagedTargets > multiMissileTgtNum', allowing N+1 targets); more missiles at an already engaged target don't add a target
-                                // Check that launch is possible before entering GuardMissileRoutine, or that missile is on a turret
-                                MissileLauncher ml = CurrentMissile as MissileLauncher;
-                                launchAuthorized = launchAuthorized && ((ml is not null && (ml.customTurret.Count > 0 || ml.missileTurret || (ml.multiLauncher && ml.multiLauncher.turret))) || GetLaunchAuthorization(guardTarget, this, CurrentMissile));
+                                // Launch depth, torpedo drop, terrain, guard angle, DLZ and unguided range checks, then turret or GetLaunchAuthorization (see GuardMissileLaunchAuthorized).
+                                // Already fired on max allowed targets (was 'engagedTargets > multiMissileTgtNum', allowing N+1 targets); more missiles at an already engaged target don't add a target.
+                                bool launchAuthorized = GuardMissileLaunchAuthorized(currentTarget, CurrentMissile, unguidedWeapon, !(engagedTargets >= multiMissileTgtNum && firedMissiles <= 0));
 
 
                                 if (BDArmorySettings.DEBUG_MISSILES)
