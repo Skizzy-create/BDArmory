@@ -7229,7 +7229,9 @@ namespace BDArmory.Control
                                     {
                                         if (currMissileType == MissileType.DepthCharge)
                                         {
-                                            if (distance < candidateYield) continue; //could add in prioritization for bigger boom, but how many different options for depth charges are there?
+                                            // Was 'distance < candidateYield', which ruled out depth charges whenever the target was within a blast radius, i.e., whenever passing over it.
+                                            // Depth charges detonate at depth, so allow them if a charge dropped now would detonate clear of us (3D distance at the detonation depth).
+                                            if (distance < candidateYield && !DepthChargeDetonatesClear(SLW, targetVessel)) continue; //could add in prioritization for bigger boom, but how many different options for depth charges are there?
                                             targetWeapon = item.Current;
                                             targetWeaponPriority = candidatePriority;
                                             break;
@@ -8357,7 +8359,7 @@ namespace BDArmory.Control
                     case WeaponClasses.SLW:
                         {
                             MissileBase ml = (MissileBase)weaponCandidate;
-                            if (distanceToTarget < engageableWeapon.GetEngagementRangeMin()) return false;
+                            if (distanceToTarget < engageableWeapon.GetEngagementRangeMin() && !DepthChargeDetonatesClear(ml, targetVessel)) return false; // Depth charges detonate at depth, so the min range doesn't apply if the detonation is clear of us.
 
                             // Enable sonar, or radar, if no sonar is found.
                             if (((MissileBase)weaponCandidate).TargetingMode == MissileBase.TargetingModes.Radar)
@@ -9224,6 +9226,9 @@ namespace BDArmory.Control
                 Vector3 torpImpactPos = missileReferencePosition + vessel.srf_vel_direction * (vessel.horizontalSrfSpeed * bombFlightTime); //might need a projectonPlane, check what srf_vel_dir actually outputs - parallel to surface, or vel direction when !orbit
                 missileReferencePosition = torpImpactPos - ((float)FlightGlobals.getAltitudeAtPos(torpImpactPos) * VectorUtils.GetUpDirection(torpImpactPos));
             }
+            // Depth charges on submerged targets: the guard angle, DLZ and unguided range checks assume the weapon flies to the target.
+            // Depth charges are dropped and sink to their fuze depth instead, which GetLaunchAuthorization checks (see DepthChargeReleaseAuthorized).
+            if (IsAntiSubDropAttack(missile, targetVessel)) return launchAuthorized && GetLaunchAuthorization(targetVessel, this, missile);
             //float targetAngle = VectorUtils.Angle(-transform.forward, guardTarget.transform.position - transform.position);
             float targetAngle = VectorUtils.Angle(missile.MissileReferenceTransform.forward, targetVessel.CoM - missileReferencePosition);
             float targetDistance = Vector3.Distance(target.position, missileReferencePosition);
@@ -11234,6 +11239,125 @@ namespace BDArmory.Control
             return closureTime;
         }
 
+        #region Anti-submarine drop weapons
+        /// <summary>
+        /// Sink rate (m/s) assumed for depth charges. Real ones sank at roughly 2-5 m/s (e.g., ~4.4 m/s for the Mk 9, ~3 m/s for the Type 3).
+        /// </summary>
+        const float depthChargeSinkRate = 4f;
+
+        /// <summary>
+        /// Whether the missile is a depth charge (or another unguided, unpowered anti-submarine weapon dropped from a rack or rail) being used against a submerged target.
+        /// These are released over or near the target and detonate at depth, so the blast radius distance gates that assume a detonation at the target don't apply.
+        /// Instead, the predicted detonation point is checked (see DepthChargeReleaseAuthorized and DepthChargeDetonatesClear).
+        /// </summary>
+        bool IsAntiSubDropAttack(MissileBase missile, Vessel targetVessel)
+        {
+            if (missile == null || targetVessel == null || vessel == null) return false;
+            if (targetVessel.altitude >= -20) return false; // Submerged targets only (as TargetInfo.isUnderwater); surface targets keep the usual checks.
+            if (vessel.altitude <= targetVessel.altitude) return false; // Dropped from above the target.
+            if (missile.HasTurrets()) return false; // Projectors on turrets are aimed as usual.
+            if (missile is not MissileLauncher launcher) return false;
+            bool powered = (launcher.thrust > 0 && launcher.boostTime > 0) || (launcher.cruiseThrust > 0 && launcher.cruiseTime > 0);
+            if (powered) return false; // Rocket-thrown charges fly to the target, use the usual checks.
+            return missile.GetMissileType() == MissileType.DepthCharge || (missile.GetWeaponClass() == WeaponClasses.SLW && missile.GuidanceMode == GuidanceModes.None);
+        }
+
+        /// <summary>
+        /// Predict where and when the depth charge detonates if released now: it falls to the water (when dropped from above it) carrying our velocity (plus its ejection speed),
+        /// then sinks at depthChargeSinkRate to its fuze depth (descending MSL altitude fuze or timed fuze), or to the target's depth for proximity/contact fuzes.
+        /// </summary>
+        void PredictDepthChargeDetonation(MissileBase missile, Vessel targetVessel, out Vector3 detonationPosition, out float detonationTime)
+        {
+            var launcher = missile as MissileLauncher;
+            Vector3 releasePosition = missile.MissileReferenceTransform.position;
+            Vector3 up = VectorUtils.GetUpDirection(releasePosition);
+            float releaseAltitude = (float)FlightGlobals.getAltitudeAtPos(releasePosition);
+            Vector3 velocity = vessel.Velocity();
+            if (launcher != null && launcher.decoupleSpeed > 0) velocity += (launcher.decoupleForward ? missile.MissileReferenceTransform.forward : -missile.MissileReferenceTransform.up) * launcher.decoupleSpeed;
+
+            // Fall to the water (ignoring air drag).
+            float airTime = 0f;
+            Vector3 entryPosition = releasePosition;
+            if (releaseAltitude > 0f)
+            {
+                float gravity = Mathf.Max((float)FlightGlobals.getGeeForceAtPosition(releasePosition).magnitude, 0.1f);
+                float upSpeed = Vector3.Dot(velocity, up);
+                airTime = (upSpeed + BDAMath.Sqrt(upSpeed * upSpeed + 2f * gravity * releaseAltitude)) / gravity;
+                entryPosition = releasePosition + Vector3.ProjectOnPlane(velocity, up) * airTime;
+                entryPosition -= (float)FlightGlobals.getAltitudeAtPos(entryPosition) * up; // At the surface.
+            }
+            float entryDepth = Mathf.Max(0f, -releaseAltitude);
+
+            // Fuze depth.
+            float fuzeDepth;
+            if (launcher != null && launcher.altitudeFuze == MissileLauncher.AltitudeFuzeMode.DescendingMSL && launcher.altitudeDetonationAlt < 0f)
+                fuzeDepth = -launcher.altitudeDetonationAlt; // Hydrostatic (depth) fuze.
+            else if (missile.isTimed)
+                fuzeDepth = entryDepth + Mathf.Max(0f, missile.detonationTime - airTime) * depthChargeSinkRate; // Timed fuze.
+            else
+                fuzeDepth = Mathf.Max(0f, -(float)targetVessel.altitude); // Proximity or contact fuze: detonates at the target, if at all.
+            float sinkDistance = Mathf.Max(0f, fuzeDepth - entryDepth); // Water drag stops the horizontal drift within a few metres, so it sinks more or less straight down.
+            detonationPosition = entryPosition - sinkDistance * up;
+            detonationTime = airTime + sinkDistance / depthChargeSinkRate;
+        }
+
+        /// <summary>
+        /// The 3D distance at detonation time from the predicted detonation point to the nearest part of our vessel (and to friendly vessels), assuming they keep their current velocity.
+        /// </summary>
+        float DepthChargeClearance(Vector3 detonationPosition, float detonationTime)
+        {
+            float minSqrDistance = float.MaxValue;
+            Vector3 ownOffset = (Vector3)vessel.Velocity() * detonationTime;
+            for (int i = 0; i < vessel.parts.Count; ++i)
+            {
+                var p = vessel.parts[i];
+                if (p == null) continue;
+                float sqrDistance = (p.transform.position + ownOffset - detonationPosition).sqrMagnitude;
+                if (sqrDistance < minSqrDistance) minSqrDistance = sqrDistance;
+            }
+            var loadedVessels = BDATargetManager.LoadedVessels;
+            if (loadedVessels != null)
+                for (int i = 0; i < loadedVessels.Count; ++i)
+                {
+                    var v = loadedVessels[i];
+                    if (v == null || v == vessel || !v.loaded || v.packed) continue;
+                    var wm = v.ActiveController().WM;
+                    if (wm == null || !Team.IsFriendly(wm.Team)) continue;
+                    float distance = Mathf.Max(0f, (v.CoM + (Vector3)v.Velocity() * detonationTime - detonationPosition).magnitude - v.GetRadius(average: true));
+                    if (distance * distance < minSqrDistance) minSqrDistance = distance * distance;
+                }
+            return minSqrDistance < float.MaxValue ? BDAMath.Sqrt(minSqrDistance) : float.MaxValue;
+        }
+
+        /// <summary>
+        /// Release the depth charge when its predicted detonation at depth is within the effective blast radius (0.68x, as for bombs) of where the target will be by then,
+        /// and at least a blast radius from our vessel and friendlies (3D distance at the detonation depth, rather than the surface distance at release).
+        /// </summary>
+        bool DepthChargeReleaseAuthorized(MissileBase missile, Vessel targetVessel)
+        {
+            PredictDepthChargeDetonation(missile, targetVessel, out Vector3 detonationPosition, out float detonationTime);
+            float blastRadius = missile.GetBlastRadius();
+            Vector3 targetPosition = targetVessel.CoM + (Vector3)targetVessel.Velocity() * detonationTime;
+            float missDistance = (detonationPosition - targetPosition).magnitude;
+            bool onTarget = missDistance < 0.68f * blastRadius;
+            float clearance = onTarget ? DepthChargeClearance(detonationPosition, detonationTime) : -1f;
+            bool clear = clearance > blastRadius;
+            if (BDArmorySettings.DEBUG_MISSILES) Debug.Log($"[BDArmory.MissileFire]: {vessel.vesselName} depth charge {missile.shortName} vs {targetVessel.vesselName}: detonation in {detonationTime:F1}s at {-(float)FlightGlobals.getAltitudeAtPos(detonationPosition):F0}m depth, miss {missDistance:F0}m (lethal < {0.68f * blastRadius:F0}m), clearance {(onTarget ? $"{clearance:F0}m" : "n/a")} (blast radius {blastRadius:F0}m) => {(onTarget && clear ? "release" : "hold")}");
+            return onTarget && clear;
+        }
+
+        /// <summary>
+        /// For weapon selection: whether a depth charge dropped now would detonate at least a blast radius from our vessel and friendlies (3D distance at the detonation depth).
+        /// Replaces requiring the target to be a blast radius away (which ruled out passing over the target). Charges that detonate near the surface still fail this when the target is close.
+        /// </summary>
+        bool DepthChargeDetonatesClear(MissileBase missile, Vessel targetVessel)
+        {
+            if (!IsAntiSubDropAttack(missile, targetVessel)) return false;
+            PredictDepthChargeDetonation(missile, targetVessel, out Vector3 detonationPosition, out float detonationTime);
+            return DepthChargeClearance(detonationPosition, detonationTime) > missile.GetBlastRadius();
+        }
+        #endregion Anti-submarine drop weapons
+
         // moved from pilot AI, as it does not really do anything AI related?
         public bool GetLaunchAuthorization(Vessel targetV, MissileFire mf, MissileBase missile)
         {
@@ -11241,6 +11365,9 @@ namespace BDArmory.Control
             MissileLauncher mlauncher = missile as MissileLauncher;
             if (missile != null && targetV != null)
             {
+                // Depth charges on submerged targets: release when the predicted detonation at depth is on the target and clear of us, instead of the boresight checks.
+                if (IsAntiSubDropAttack(missile, targetV)) return DepthChargeReleaseAuthorized(missile, targetV);
+
                 Vector3 target = targetV.CoM;
 
                 if (missile.GetWeaponClass() == WeaponClasses.SLW && !vessel.Splashed && (targetV.CoM - vessel.CoM).sqrMagnitude < ((vessel.horizontalSrfSpeed * bombFlightTime) * (vessel.horizontalSrfSpeed * bombFlightTime)))
