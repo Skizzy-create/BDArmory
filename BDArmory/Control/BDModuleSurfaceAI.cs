@@ -902,7 +902,7 @@ namespace BDArmory.Control
                     SetStatus(bypassTarget ? "Repositioning" : "Moving");
                     if (IsRunningWaypoints)
                     {
-                        if (BDArmorySettings.WAYPOINT_LOOP_INDEX > 1)
+                        if (ShowWaypointLap)
                             SetStatus($"Lap {activeWaypointLap}, Waypoint {activeWaypointIndex} ({waypointRange:F0}m)");
                         else
                             SetStatus($"Waypoint {activeWaypointIndex} ({waypointRange:F0}m)");

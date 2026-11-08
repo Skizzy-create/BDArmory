@@ -666,7 +666,7 @@ UI_Toggle(enabledText = "#LOC_BDArmory_true", disabledText = "#LOC_BDArmory_fals
                 SetStatus("Moving");
                 if (IsRunningWaypoints)
                 {
-                    if (BDArmorySettings.WAYPOINT_LOOP_INDEX > 1)
+                    if (ShowWaypointLap)
                         SetStatus($"Lap {activeWaypointLap}, Waypoint {activeWaypointIndex} ({waypointRange:F0}m)");
                     else
                         SetStatus($"Waypoint {activeWaypointIndex} ({waypointRange:F0}m)");

@@ -533,6 +533,7 @@ namespace BDArmory.Control
         public void ClearWaypoints()
         {
             if (BDArmorySettings.DEBUG_AI) Debug.Log("[BDArmory.BDGenericAIBase]: Cleared waypoints");
+            if (customWaypointRoute) EndCustomWaypointRoute();
             this.waypoints = null;
             this.activeWaypointIndex = -1;
         }
@@ -546,6 +547,7 @@ namespace BDArmory.Control
                 return;
             }
             if (BDArmorySettings.DEBUG_AI) Debug.Log(string.Format("[BDArmory.BDGenericAIBase]: Set {0} waypoints", waypoints.Count));
+            if (customWaypointRoute) EndCustomWaypointRoute(); // [Overdrive F6] Back to the course-based waypoints.
             this.waypoints = waypoints;
             this.waypointCourseIndex = BDArmorySettings.WAYPOINT_COURSE_INDEX;
             this.activeWaypointIndex = 0;
@@ -557,11 +559,186 @@ namespace BDArmory.Control
             CommandFollowWaypoints();
         }
 
+        #region Overdrive F6: custom waypoint routes
+        // A route set with SetWaypoints(points, radiusM, laps, ...) is decoupled from WaypointCourses and the WAYPOINT_* globals:
+        // its own gate radius per point, its own lap count, optional per-point speed limits, guard mode only if asked, and no waypoint competition scoring.
+        protected bool customWaypointRoute = false;
+        float customWaypointRadius = DefaultCustomWaypointRadius;
+        readonly List<float> customWaypointRadii = [];
+        readonly List<float> customWaypointMaxSpeeds = [];
+        bool customWaypointGuardAtEnd = false;
+        float customWaypointSpeedToRestore = -1f; // The AI's max speed when the route started, restored when it ends (only when speed limits were given).
+        public const float DefaultCustomWaypointRadius = 500f;
+
+        /// <summary>[Overdrive F6] Whether the current waypoints are a custom route (SetWaypoints with a radius) rather than a waypoint course.</summary>
+        public bool IsCustomWaypointRoute => customWaypointRoute;
+        /// <summary>[Overdrive F6] The current lap (1-based) of the waypoints.</summary>
+        public int CurrentWaypointLap => activeWaypointLap;
+        /// <summary>[Overdrive F6] The number of laps of the waypoints.</summary>
+        public int WaypointLapLimit => waypointLapLimit;
+        /// <summary>[Overdrive F6] Raised when a vessel reaches a gate of a custom route: (AI, waypoint index, lap). Not raised for waypoint courses.</summary>
+        public static event System.Action<BDGenericAIBase, int, int> OnCustomWaypointReached;
+        /// <summary>[Overdrive F6] Raised when a custom route completes its last lap.</summary>
+        public static event System.Action<BDGenericAIBase> OnCustomWaypointRouteCompleted;
+
+        /// <summary>
+        /// [Overdrive F6] Follow a route of (latitude, longitude, altitude above terrain) points, independent of WaypointCourses and of the
+        /// WAYPOINT_COURSE_INDEX / WAYPOINT_LOOP_INDEX / WAYPOINT_GUARD_INDEX / WAYPOINTS_SCALE settings. Any number of points.
+        /// </summary>
+        /// <param name="points">The points (copied).</param>
+        /// <param name="radiusM">Gate radius in metres for points without their own radius (0 or less: 500 m).</param>
+        /// <param name="laps">Number of laps (at least 1).</param>
+        /// <param name="maxSpeeds">Optional per-point max speed (m/s) applied when heading for that point; 0 or less, or missing, means the AI's own max speed.</param>
+        /// <param name="guardAtEnd">Turn guard mode on when the route completes.</param>
+        /// <param name="radii">Optional per-point gate radius (m); 0 or less, or missing, means radiusM.</param>
+        /// <returns>False if the list is empty, or the AI isn't active (pilotEnabled is false) so the route didn't start.</returns>
+        public bool SetWaypoints(List<Vector3> points, float radiusM, int laps, IList<float> maxSpeeds = null, bool guardAtEnd = false, IList<float> radii = null)
+        {
+            if (points == null || points.Count == 0)
+            {
+                ClearWaypoints();
+                return false;
+            }
+            if (customWaypointRoute) EndCustomWaypointRoute();
+            customWaypointRoute = true;
+            customWaypointRadius = radiusM > 0 ? radiusM : DefaultCustomWaypointRadius;
+            customWaypointRadii.Clear();
+            if (radii != null) for (int i = 0; i < radii.Count; ++i) customWaypointRadii.Add(radii[i]);
+            customWaypointMaxSpeeds.Clear();
+            if (maxSpeeds != null) for (int i = 0; i < maxSpeeds.Count; ++i) customWaypointMaxSpeeds.Add(maxSpeeds[i]);
+            customWaypointGuardAtEnd = guardAtEnd;
+            customWaypointSpeedToRestore = customWaypointMaxSpeeds.Count > 0 ? GetAIMaxSpeed() : -1f;
+            this.waypoints = new List<Vector3>(points);
+            this.waypointCourseIndex = 0;
+            this.activeWaypointIndex = 0;
+            this.activeWaypointLap = 1;
+            this.waypointLapLimit = System.Math.Max(1, laps);
+            var waypoint = this.waypoints[activeWaypointIndex];
+            var terrainAltitude = FlightGlobals.currentMainBody.TerrainAltitude(waypoint.x, waypoint.y);
+            waypointPosition = FlightGlobals.currentMainBody.GetWorldSurfacePosition(waypoint.x, waypoint.y, waypoint.z + terrainAltitude);
+            ApplyCustomWaypointSpeed();
+            CommandFollowWaypoints();
+            return pilotEnabled;
+        }
+
+        void EndCustomWaypointRoute()
+        {
+            customWaypointRoute = false;
+            if (customWaypointSpeedToRestore > 0) SetAIMaxSpeed(customWaypointSpeedToRestore);
+            customWaypointSpeedToRestore = -1f;
+            customWaypointRadii.Clear();
+            customWaypointMaxSpeeds.Clear();
+        }
+
+        /// <summary>The gate radius of the current waypoint (stock: WAYPOINTS_SCALE or the course's gate scale).</summary>
+        protected float CurrentWaypointRadius()
+        {
+            if (customWaypointRoute)
+                return activeWaypointIndex >= 0 && activeWaypointIndex < customWaypointRadii.Count && customWaypointRadii[activeWaypointIndex] > 0 ? customWaypointRadii[activeWaypointIndex] : customWaypointRadius;
+            return BDArmorySettings.WAYPOINTS_SCALE > 0 ? BDArmorySettings.WAYPOINTS_SCALE : WaypointCourses.CourseLocations[waypointCourseIndex].waypoints[activeWaypointIndex].scale;
+        }
+
+        /// <summary>The name of the current waypoint (empty for custom routes).</summary>
+        protected string CurrentWaypointName() => customWaypointRoute ? "" : WaypointCourses.CourseLocations[waypointCourseIndex].waypoints[activeWaypointIndex].name;
+
+        /// <summary>Whether to show the lap in the status.</summary>
+        protected bool ShowWaypointLap => customWaypointRoute ? waypointLapLimit > 1 : BDArmorySettings.WAYPOINT_LOOP_INDEX > 1;
+
+        void ApplyCustomWaypointSpeed()
+        {
+            if (customWaypointMaxSpeeds.Count == 0) return;
+            float speed = activeWaypointIndex >= 0 && activeWaypointIndex < customWaypointMaxSpeeds.Count ? customWaypointMaxSpeeds[activeWaypointIndex] : 0f;
+            SetAIMaxSpeed(speed > 0 ? speed : customWaypointSpeedToRestore);
+        }
+
+        float GetAIMaxSpeed()
+        {
+            var ai = vessel != null ? vessel.ActiveController().AI : null;
+            if (ai == null) return -1f;
+            return ai.aiType switch
+            {
+                AIType.PilotAI => (ai as BDModulePilotAI).maxSpeed,
+                AIType.SurfaceAI => (ai as BDModuleSurfaceAI).MaxSpeed,
+                AIType.VTOLAI => (ai as BDModuleVTOLAI).MaxSpeed,
+                _ => -1f,
+            };
+        }
+
+        void SetAIMaxSpeed(float speed)
+        {
+            if (speed <= 0) return;
+            var ai = vessel != null ? vessel.ActiveController().AI : null;
+            if (ai == null) return;
+            switch (ai.aiType)
+            {
+                case AIType.PilotAI:
+                    var pilotAI = ai as BDModulePilotAI;
+                    pilotAI.maxSpeed = speed;
+                    pilotAI.OnMaxSpeedChanged();
+                    break;
+                case AIType.SurfaceAI: (ai as BDModuleSurfaceAI).MaxSpeed = speed; break;
+                case AIType.VTOLAI: (ai as BDModuleVTOLAI).MaxSpeed = speed; break;
+            }
+        }
+
+        void UpdateCustomWaypoint()
+        {
+            var waypoint = waypoints[activeWaypointIndex];
+            var terrainAltitude = FlightGlobals.currentMainBody.TerrainAltitude(waypoint.x, waypoint.y);
+            waypointPosition = FlightGlobals.currentMainBody.GetWorldSurfacePosition(waypoint.x, waypoint.y, waypoint.z + terrainAltitude);
+            waypointRange = (float)(vesselTransform.position - waypointPosition).magnitude;
+            var timeToCPA = AIUtils.TimeToCPA(vessel.transform.position - waypointPosition, vessel.Velocity(), vessel.acceleration, Time.fixedDeltaTime);
+            if (waypointRange >= CurrentWaypointRadius() || timeToCPA >= Time.fixedDeltaTime) return;
+            int reachedIndex = activeWaypointIndex, reachedLap = activeWaypointLap;
+            if (BDArmorySettings.DEBUG_AI) Debug.Log($"[BDArmory.BDGenericAIBase]: {vessel.vesselName} reached custom waypoint {reachedIndex} (lap {reachedLap}/{waypointLapLimit})");
+            ++activeWaypointIndex;
+            bool completed = false;
+            if (activeWaypointIndex >= waypoints.Count)
+            {
+                activeWaypointIndex = 0;
+                activeWaypointLap++;
+                completed = activeWaypointLap > waypointLapLimit;
+            }
+            if (OnCustomWaypointReached != null)
+            {
+                try { OnCustomWaypointReached(this, reachedIndex, reachedLap); }
+                catch (System.Exception e) { Debug.LogError($"[BDArmory.BDGenericAIBase]: OnCustomWaypointReached handler threw: {e}"); }
+            }
+            if (completed)
+            {
+                if (BDArmorySettings.DEBUG_AI) Debug.Log("[BDArmory.BDGenericAIBase]: Custom waypoint route complete");
+                bool guardAtEnd = customWaypointGuardAtEnd;
+                waypoints = null;
+                activeWaypointIndex = -1;
+                EndCustomWaypointRoute();
+                ReleaseCommand();
+                if (guardAtEnd)
+                {
+                    var weaponManager = WeaponManager;
+                    if (weaponManager != null && !weaponManager.guardMode) weaponManager.guardMode = true;
+                }
+                if (OnCustomWaypointRouteCompleted != null)
+                {
+                    try { OnCustomWaypointRouteCompleted(this); }
+                    catch (System.Exception e) { Debug.LogError($"[BDArmory.BDGenericAIBase]: OnCustomWaypointRouteCompleted handler threw: {e}"); }
+                }
+                return;
+            }
+            ApplyCustomWaypointSpeed();
+            UpdateCustomWaypoint(); // Recompute for the new waypoint.
+        }
+        #endregion
+
         protected virtual void UpdateWaypoint()
         {
             if (activeWaypointIndex < 0 || waypoints == null || waypoints.Count == 0)
             {
                 if (command == PilotCommands.Waypoints) ReleaseCommand();
+                return;
+            }
+            if (customWaypointRoute) // [Overdrive F6]
+            {
+                UpdateCustomWaypoint();
                 return;
             }
             var waypoint = waypoints[activeWaypointIndex];

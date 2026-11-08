@@ -2379,7 +2379,7 @@ namespace BDArmory.Competition
             {
                 if (weaponManager == null || weaponManager.vessel == null) continue;
                 var ai = weaponManager.AI as BDGenericAIBase;
-                if (ai == null || !ai.IsRunningWaypoints) continue;
+                if (ai == null || !ai.IsRunningWaypoints || ai.IsCustomWaypointRoute) continue; // [Overdrive F6] Custom routes are not waypoint competition runs.
                 var player = weaponManager.vessel.vesselName;
                 if (!Scores.Players.Contains(player)) continue;
                 if (Scores.ScoreData[player].waypointsReached.Count == 0) // Hasn't reached the first waypoint.

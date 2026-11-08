@@ -3562,17 +3562,17 @@ namespace BDArmory.Control
         {
             Vector3 vesselPos = vessel.transform.position;
             // Note: UpdateWaypoint is called separately before this in case FlyWaypoints doesn't get called.
-            if (BDArmorySettings.WAYPOINT_LOOP_INDEX > 1)
+            if (ShowWaypointLap)
             {
                 SetStatus($"Lap {activeWaypointLap}, Waypoint {activeWaypointIndex} ({waypointRange:F0}m)");
             }
             else
             {
-                var wpName = WaypointCourses.CourseLocations[waypointCourseIndex].waypoints[activeWaypointIndex].name;
+                var wpName = CurrentWaypointName(); // [Overdrive F6] Custom routes aren't tied to a course.
                 SetStatus($"Waypoint {activeWaypointIndex}{(string.IsNullOrEmpty(wpName) ? "" : $" {wpName}")} ({waypointRange:F0}m)");
             }
             var waypointDirection = (waypointPosition - vesselPos).normalized;
-            if (waypointRange < (BDArmorySettings.WAYPOINTS_SCALE > 0 ? BDArmorySettings.WAYPOINTS_SCALE : (WaypointCourses.CourseLocations[waypointCourseIndex].waypoints[activeWaypointIndex].scale)) / 2) //gate radius
+            if (waypointRange < CurrentWaypointRadius() / 2) //gate radius ([Overdrive F6] stock: WAYPOINTS_SCALE or the course gate scale)
             {
                 //if (VectorUtils.Angle(waypointDirection, vessel.ReferenceTransform.up) > maxAllowedAoA)//as we get closer angle to WP is going to very rapidly increase from ~0 to 90 if not *perfectly* aligned
                 //    waypointDirection = vessel.Velocity(); //so if within [gate radius] distance of the WP, if the angle to the gate exceeds max AOA angle, commit to current direaction to prevent control jerk at the last second as the AI tries to correct off-targetness
