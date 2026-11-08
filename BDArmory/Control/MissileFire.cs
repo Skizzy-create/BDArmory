@@ -469,6 +469,9 @@ namespace BDArmory.Control
 
         bool externalOverride = false; // The current overrideTarget was set by SetOverrideTarget(target, durationS, sticky).
         bool externalOverrideSticky = false;
+        float externalOverrideExpiry = 0f; // Time.time when the external assignment expires (+Infinity: until cleared).
+        bool externalSecondaryProvided = false; // ExternalSecondaryTargets returned a list at the last scan.
+        bool externalSecondaryErrorLogged = false;
         readonly HashSet<TargetInfo> externalSecondarySet = []; // Snapshot of the last ExternalSecondaryTargets result (for Tight authority checks).
         readonly List<TargetInfo> externalSecondaryList = []; // Same, in priority order.
 
@@ -478,8 +481,8 @@ namespace BDArmory.Control
         public TargetInfo ExternalOverrideTarget => externalOverride ? overrideTarget : null;
         /// <summary>[Overdrive F1] Whether the live external assignment is sticky.</summary>
         public bool ExternalOverrideSticky => externalOverride && externalOverrideSticky;
-        /// <summary>[Overdrive F1] Seconds left on the live external assignment (+Infinity until cleared, 0 when none). Counts down while guard mode runs.</summary>
-        public float ExternalOverrideTimeRemaining => externalOverride ? Mathf.Max(0f, overrideTimer) : 0f;
+        /// <summary>[Overdrive F1] Seconds of game time (Time.time) left on the live external assignment (+Infinity until cleared, 0 when none).</summary>
+        public float ExternalOverrideTimeRemaining => externalOverride ? Mathf.Max(0f, externalOverrideExpiry - Time.time) : 0f;
         /// <summary>[Overdrive F1] Whether a weapon could engage the external assignment at the last target scan (false while a sticky assignment is out of every envelope).</summary>
         public bool ExternalOverrideEngageable { get; private set; } = false;
         /// <summary>[Overdrive F1] Why the last external assignment ended.</summary>
@@ -497,7 +500,7 @@ namespace BDArmory.Control
 
         /// <summary>
         /// [Overdrive F1] Assign a target from an external controller. Unlike the stock SetOverrideTarget(target):
-        /// - the assignment lives for durationS seconds of guard mode (0 or less: until cleared), including through missile routines (guardFiringMissile);
+        /// - the assignment lives for durationS seconds of game time (0 or less: until cleared), including through missile routines (guardFiringMissile);
         /// - sticky: it stays the target while no weapon can engage it (the AI keeps closing); non-sticky: it's dropped at the first scan where no weapon can engage it (stock);
         /// - BDArmory's team assist can't overwrite it;
         /// - the ExternalTargetFilter still applies (a rejected target is dropped with reason Filtered).
@@ -513,6 +516,7 @@ namespace BDArmory.Control
             if (externalOverride && overrideTarget != null && overrideTarget != target) EndExternalOverride(OverrideLostReason.Replaced);
             overrideTarget = target;
             overrideTimer = FireAuthorityRules.ExternalOverrideTimer(durationS);
+            externalOverrideExpiry = float.IsPositiveInfinity(overrideTimer) ? float.PositiveInfinity : Time.time + overrideTimer;
             externalOverride = true;
             externalOverrideSticky = sticky;
             ExternalOverrideEngageable = false;
@@ -525,6 +529,19 @@ namespace BDArmory.Control
             if (!externalOverride) return;
             EndExternalOverride(OverrideLostReason.Cleared);
             targetScanTimer = -100;
+        }
+
+        /// <summary>
+        /// End the external assignment if its target is gone or it has expired; otherwise keep the override timer positive (so the stock decay doesn't drop it). Returns whether it's still live.
+        /// </summary>
+        bool CheckExternalOverrideLive()
+        {
+            if (!externalOverride) return false;
+            if (!overrideTarget) { EndExternalOverride(OverrideLostReason.TargetDestroyed); return false; }
+            float remaining = externalOverrideExpiry - Time.time;
+            if (remaining <= 0) { EndExternalOverride(OverrideLostReason.Expired); return false; }
+            overrideTimer = remaining;
+            return true;
         }
 
         void EndExternalOverride(OverrideLostReason reason)
@@ -627,14 +644,20 @@ namespace BDArmory.Control
             if (ExternalSecondaryTargets == null)
             {
                 if (externalSecondaryList.Count > 0) { externalSecondaryList.Clear(); externalSecondarySet.Clear(); }
+                externalSecondaryProvided = false;
                 return;
             }
             externalSecondaryList.Clear();
             externalSecondarySet.Clear();
+            externalSecondaryProvided = false;
             IList<TargetInfo> external = null;
             try { external = ExternalSecondaryTargets(this); }
-            catch (Exception e) { Debug.LogError($"[BDArmory.MissileFire]: ExternalSecondaryTargets threw: {e}"); }
+            catch (Exception e)
+            {
+                if (!externalSecondaryErrorLogged) { externalSecondaryErrorLogged = true; Debug.LogError($"[BDArmory.MissileFire]: ExternalSecondaryTargets threw (stock picks used; logged once per weapon manager): {e}"); }
+            }
             if (external == null) return;
+            externalSecondaryProvided = true;
             for (int i = 0; i < external.Count; ++i)
             {
                 var t = external[i];
@@ -2686,6 +2709,7 @@ namespace BDArmory.Control
                 UpdateGuidanceTargets();
             }
 
+            if (externalOverride) CheckExternalOverrideLive(); // [Overdrive F1] Expiry (game time) and target loss, whether guard mode runs or not; keeps the override timer positive through missile routines.
             if (guardMode && vessel.IsControllable) //isControllable returns false if Commsnet is enabled and probecore craft has no antenna
             {
                 GuardMode();
@@ -6158,11 +6182,12 @@ namespace BDArmory.Control
                 if (missileSaturatedTargets.Count > 0) activeTargetExclusions = missileSaturatedTargets;
             }
 
-            if (externalOverride && !overrideTarget) EndExternalOverride(OverrideLostReason.TargetDestroyed); // [Overdrive F1]
+            if (externalOverride) CheckExternalOverrideLive(); // [Overdrive F1] Target destroyed or expired.
             if (overrideTarget) //begin by checking the override target, since that takes priority
             {
-                // [Overdrive F1] External assignments honour the ExternalTargetFilter (vessels only) and can be sticky.
-                bool filteredOut = externalOverride && ExternalTargetFilter != null && !overrideTarget.isMissile && !PassesExternalFilter(overrideTarget);
+                // [Overdrive F1/F4] Overrides honour the ExternalTargetFilter (vessels only) and Tight fire authority, so team assist can't pull a unit off task;
+                // external assignments can be sticky. Always false when no filter is set and fire authority isn't Tight (stock).
+                bool filteredOut = IsTargetFilteredOut(overrideTarget);
                 bool engageable = false;
                 if (!filteredOut)
                 {
@@ -6456,7 +6481,7 @@ namespace BDArmory.Control
                     secondaryTargetSet.Add(t);
                 }
             }
-            if (!(ExternalSecondaryTargetsOnly && ExternalSecondaryTargets != null)) // [Overdrive F2] Optionally only the external picks.
+            if (!(ExternalSecondaryTargetsOnly && externalSecondaryProvided)) // [Overdrive F2] Optionally only the external picks.
             {
                 if (assignMissileTargets)
                 {
@@ -10306,15 +10331,9 @@ namespace BDArmory.Control
             if (overrideTimer > 0)
             {
                 overrideTimer -= TimeWarp.fixedDeltaTime;
-                if (externalOverride) // [Overdrive F1] External assignments end when their duration runs out or their target dies, and survive missile routines meanwhile.
-                {
-                    if (!overrideTarget) EndExternalOverride(OverrideLostReason.TargetDestroyed);
-                    else if (overrideTimer <= 0) EndExternalOverride(OverrideLostReason.Expired);
-                }
             }
             else
             {
-                if (externalOverride) EndExternalOverride(OverrideLostReason.Expired); // [Overdrive F1]
                 overrideTimer = 0;
                 overrideTarget = null;
             }
