@@ -611,7 +611,7 @@ namespace BDArmory.Control
 
         /// <summary>
         /// [Overdrive F3] Whether fire authority allows firing at the vessel. isProjectile: the weapon is engaging a shell or rocket (APS), which counts as self-defence.
-        /// Always true with Free authority. Allocation-free.
+        /// Always true with Free authority. Allocation-free; the vessel's TargetInfo is cached (this runs per weapon per frame under Tight).
         /// </summary>
         public bool FireAuthorityPermits(Vessel targetVessel, bool isProjectile = false)
         {
@@ -619,8 +619,44 @@ namespace BDArmory.Control
             if (fireAuthority == FireAuthority.Hold) return false;
             if (isProjectile) return true;
             if (targetVessel == null) return false;
-            if (!targetVessel.gameObject.TryGetComponent<TargetInfo>(out var targetInfo)) return false;
+            var targetInfo = CachedTargetInfo(targetVessel);
+            if (targetInfo == null) return false;
             return FireAuthorityPermits(targetInfo);
+        }
+
+        // [Overdrive F3] Small round-robin cache of vessel -> TargetInfo for FireAuthorityPermits(Vessel), so Tight doesn't call TryGetComponent per weapon per frame.
+        // Multi-target turrets can engage several vessels at once, hence a few entries. Only hits are cached; a destroyed TargetInfo (Unity-null) is refetched.
+        const int FireAuthorityCacheSize = 8;
+        readonly Vessel[] fireAuthorityCacheVessels = new Vessel[FireAuthorityCacheSize];
+        readonly TargetInfo[] fireAuthorityCacheInfos = new TargetInfo[FireAuthorityCacheSize];
+        int fireAuthorityCacheNext = 0;
+        TargetInfo CachedTargetInfo(Vessel targetVessel)
+        {
+            for (int i = 0; i < FireAuthorityCacheSize; ++i)
+            {
+                if (!ReferenceEquals(fireAuthorityCacheVessels[i], targetVessel)) continue;
+                var cached = fireAuthorityCacheInfos[i];
+                if (cached != null && ReferenceEquals(cached.Vessel, targetVessel)) return cached;
+                fireAuthorityCacheVessels[i] = null; // Stale (TargetInfo destroyed or reassigned).
+                fireAuthorityCacheInfos[i] = null;
+                break;
+            }
+            if (!targetVessel.gameObject.TryGetComponent<TargetInfo>(out var targetInfo) || targetInfo == null) return null;
+            fireAuthorityCacheVessels[fireAuthorityCacheNext] = targetVessel;
+            fireAuthorityCacheInfos[fireAuthorityCacheNext] = targetInfo;
+            fireAuthorityCacheNext = (fireAuthorityCacheNext + 1) % FireAuthorityCacheSize;
+            return targetInfo;
+        }
+
+        /// <summary>
+        /// [Overdrive F1/F2] The target is a vessel this weapon manager's team would never engage (own team, allied or neutral), for example after a team change.
+        /// Missiles and vessels without a team are not.
+        /// </summary>
+        bool IsNotHostile(TargetInfo target)
+        {
+            if (target == null || target.isMissile || target.Team == null) return false;
+            var team = Team;
+            return team != null && !team.IsEnemy(target.Team);
         }
 
         bool externalFilterErrorLogged = false;
@@ -661,7 +697,7 @@ namespace BDArmory.Control
             for (int i = 0; i < external.Count; ++i)
             {
                 var t = external[i];
-                if (t == null || t.Vessel == null || t.Vessel == vessel) continue;
+                if (t == null || t.Vessel == null || t.Vessel == vessel || IsNotHostile(t)) continue; // Never own-team, allied or neutral vessels (e.g. after a team change).
                 if (externalSecondarySet.Add(t)) externalSecondaryList.Add(t);
             }
         }
@@ -4886,8 +4922,10 @@ namespace BDArmory.Control
         {
             if (missile == null || missile.vessel != vessel || missile.launched || missile.HasFired) return false;
             if ((missile.warheadType == MissileBase.WarheadTypes.EMP || missile.warheadType == MissileBase.WarheadTypes.Nuke) && guardMode && (currentTarget == null || guardTarget == null)) return false;
-            return FireCurrentMissile(missile, checkClearance, target);
+            lastLaunchedMissile = null;
+            return FireCurrentMissile(missile, checkClearance, target) && lastLaunchedMissile != null; // False when the mount refused (e.g. a rotary rail missile that isn't the ready one).
         }
+        MissileBase lastLaunchedMissile; // [Overdrive F9] The missile FireCurrentMissile last saw launch (it may swap in an identical missile with clearance).
         #endregion
 
         bool FireCurrentMissile(MissileBase missile, bool checkClearance, Vessel targetVessel = null, TargetData targetData = null)
@@ -4974,7 +5012,11 @@ namespace BDArmory.Control
 
             //PreviousMissile = CurrentMissile;
             ++guardMissilesFiredCount; // Lets the parallel salvo tell whether GuardMissileRoutineCore fired.
-            RaiseOnMissileFired(missile, targetVessel); // [Overdrive F9]
+            if (missile.launched || missile.HasFired) // [Overdrive F9] Only report real launches (a rotary rail refuses a missile that isn't its ready one).
+            {
+                lastLaunchedMissile = missile;
+                RaiseOnMissileFired(missile, targetVessel);
+            }
             UpdateList();
             if (DisengageAfterFiring)
             {
@@ -6208,7 +6250,7 @@ namespace BDArmory.Control
                 if (missileSaturatedTargets.Count > 0) activeTargetExclusions = missileSaturatedTargets;
             }
 
-            if (externalOverride) CheckExternalOverrideLive(); // [Overdrive F1] Target destroyed or expired.
+            if (externalOverride && CheckExternalOverrideLive() && IsNotHostile(overrideTarget)) EndExternalOverride(OverrideLostReason.NotHostile); // [Overdrive F1] Target destroyed or expired, or no longer hostile (team change).
             if (overrideTarget) //begin by checking the override target, since that takes priority
             {
                 // [Overdrive F1/F4] Overrides honour the ExternalTargetFilter (vessels only) and Tight fire authority, so team assist can't pull a unit off task;

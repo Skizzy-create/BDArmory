@@ -31,6 +31,8 @@ namespace BDArmory.Control
         NotEngageable,
         /// <summary>The ExternalTargetFilter rejected the assigned target.</summary>
         Filtered,
+        /// <summary>The target is on this weapon manager's team, an allied team or a neutral team (for example after a team change), so it would never be engaged.</summary>
+        NotHostile,
     }
 
     /// <summary>
