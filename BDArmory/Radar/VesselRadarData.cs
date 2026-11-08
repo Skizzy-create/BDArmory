@@ -140,6 +140,20 @@ namespace BDArmory.Radar
         //TargetSignatureData[] contacts = new TargetSignatureData[30];
         private List<RadarDisplayData> displayedTargets;
         private List<IRSTDisplayData> displayedIRTargets;
+
+        /// <summary>
+        /// [Overdrive F5] The radar and sonar contacts on this vessel's display (own and datalinked radars), read-only. Includes locked contacts.
+        /// The live list, not a copy: read it on the main thread and don't keep it across frames. Empty before the radar data initialises.
+        /// </summary>
+        public IReadOnlyList<RadarDisplayData> DisplayedContacts => displayedTargets ?? (IReadOnlyList<RadarDisplayData>)System.Array.Empty<RadarDisplayData>();
+        /// <summary>
+        /// [Overdrive F5] The IRST contacts on this vessel's display, read-only. Same rules as DisplayedContacts.
+        /// </summary>
+        public IReadOnlyList<IRSTDisplayData> DisplayedIRContacts => displayedIRTargets ?? (IReadOnlyList<IRSTDisplayData>)System.Array.Empty<IRSTDisplayData>();
+        /// <summary>
+        /// [Overdrive F5] Index into DisplayedContacts of the active locked contact, or -1 when nothing is locked.
+        /// </summary>
+        public int ActiveLockedContactIndex => locked && lockedTargetIndexes != null && activeLockedTargetIndex >= 0 && activeLockedTargetIndex < lockedTargetIndexes.Count ? lockedTargetIndexes[activeLockedTargetIndex] : -1;
         public bool locked;
         private int activeLockedTargetIndex;
         private List<int> lockedTargetIndexes;
