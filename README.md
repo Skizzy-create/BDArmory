@@ -16,8 +16,14 @@ This is an unofficial build. Please report problems with it
 Download
 ========
 
-- **CKAN**: install "BDArmory Overdrive" (`BDArmory-Overdrive`). It provides `BDArmory` and
-  `BDArmoryForRunwayProject`, so mods that depend on BDArmory install with it.
+- **CKAN**: BDArmory Overdrive (`BDArmory-Overdrive`) is listed in the SkizzyNaval metadata
+  repository (not yet in the main CKAN index). In CKAN, open *Settings* > *Metadata
+  repositories* > *New*, enter the name `SkizzyNaval` and the URL
+  `https://github.com/Skizzy-create/skizzy-ckan/archive/refs/heads/main.tar.gz`, keep
+  `KSP-default`, refresh, and install "BDArmory Overdrive". It provides `BDArmory` and
+  `BDArmoryForRunwayProject`, so mods that depend on BDArmory install with it. If you have
+  `BDArmory-Skizzy`, switch with `ckan update`, `ckan upgrade --all` (picks up its
+  `replaced_by`), then `ckan replace BDArmory-Skizzy` (or tick *Replace* in the GUI).
 - **Manual**: download `BDArmoryOverdrive-<version>.zip` from
   [Releases](https://github.com/Skizzy-create/BDArmory/releases) and unzip it into the KSP
   folder, so that you get `GameData/BDArmory`. Remove any other BDArmory first. It needs
