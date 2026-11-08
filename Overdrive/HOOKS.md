@@ -1,6 +1,6 @@
 # BDArmory Overdrive: integration hooks
 
-Public API reference for plugins that reference `BDArmory.dll` (for example the Skizzy adapter). Everything here was read from the code on branch `overdrive-hooks` (commits `ec38cf761`..`b1a9446e4`). Names and signatures are exact; behaviour is what the code does, including its quirks.
+Public API reference for plugins that reference `BDArmory.dll` (for example the Skizzy adapter). Everything here was read from the code on branch `overdrive-hooks` (commits from `ec38cf761`, including the review fixes). Names and signatures are exact; behaviour is what the code does, including its quirks.
 
 ## 1. Overview
 
@@ -64,17 +64,19 @@ On stock BDA Plus every entry is `false` (and `F5` etc. cannot be used at all); 
 | F4 | Done | `MissileFire.ExternalTargetFilter`, `IsTargetFilteredOut(TargetInfo)`, `IsTargetExcluded(TargetInfo)`; `BDATargetManager` query changes |
 | F5 | Done | `VesselRadarData.DisplayedContacts`, `DisplayedIRContacts`, `ActiveLockedContactIndex` |
 | F6 | Done | `BDGenericAIBase.SetWaypoints(List<Vector3>, float, int, IList<float>, bool, IList<float>)`, `IsCustomWaypointRoute`, `CurrentWaypointLap`, `WaypointLapLimit`, `OnCustomWaypointReached`, `OnCustomWaypointRouteCompleted`, `DefaultCustomWaypointRadius` |
-| F6b | Done (pilot AI) | `BDGenericAIBase.waypointsYieldToCombat`, `patrolLeashDistance`, `patrolAnchor`, `patrolLeashCooldown`, `PatrolEngaged`, `PatrolTarget`, `OnPatrolEngage`, `OnPatrolResume` (section 8b) |
+| F6b | Done (pilot AI) | `BDGenericAIBase.waypointsYieldToCombat`, `patrolLeashDistance`, `patrolAnchor`, `PatrolLeashAnchor`, `patrolLeashCooldown`, `PatrolEngaged`, `PatrolTarget`, `OnPatrolEngage`, `OnPatrolResume` (section 8b) |
 | F8 | Not done | See section 10 |
 | F9 | Done | `MissileFire.FireMissileAt(MissileBase, Vessel, bool)`, `MissileFire.OnMissileFired` |
-| F10 | Done (partial target-lost coverage) | `CompetitionScores.OnHit`, `OnDeath`; `BDACompetitionMode.OnCompetitionStarted`, `OnCompetitionEnded`; `BDATargetManager.OnTargetDetected`, `OnTargetLost` |
+| F10 | Done | `CompetitionScores.OnHit`, `OnDeath`; `BDACompetitionMode.OnCompetitionStarted`, `OnCompetitionEnded`; `BDATargetManager.OnTargetDetected`, `OnTargetLost` |
 | F11 | Not done | See section 10 |
 | F12 | Done | `MissileFire.LastScan` |
-| OD1 | Done | Multi-spawn in the Vessel Mover; `BDArmorySettings.VESSEL_MOVER_SPAWN_*` |
+| OD1 | Done | Multi-spawn in the Vessel Mover; `BDArmorySettings.VESSEL_MOVER_SPAWN_*`; `MultiSpawnLayout` |
 
 Namespaces: `BDArmory.Control` (`MissileFire`, `BDGenericAIBase`, `FireAuthority`, `OverrideLostReason`, `OverrideScanOutcome`, `FireAuthorityRules`), `BDArmory.Targeting` (`TargetInfo`), `BDArmory.UI` (`BDATargetManager`, `LoadedVesselSwitcher`), `BDArmory.Radar` (`VesselRadarData`, `RadarDisplayData`, `IRSTDisplayData`, `ViewScanResults`, `IncomingMissile`), `BDArmory.Competition` (`BDTeam`), `BDArmory.Settings` (`BDArmorySettings`), `BDArmory.VesselSpawning` (`VesselMover`, `MultiSpawnLayout`).
 
-Getting the objects: `vessel.FindPartModuleImplementing<MissileFire>()` for the weapon manager; `wm.AI as BDGenericAIBase` (or `vessel.FindPartModuleImplementing<BDModulePilotAI>()` etc.) for the AI; `vessel.GetComponent<TargetInfo>()` for a vessel's target record (or iterate `BDATargetManager.TargetList(wm.Team)`, the targets known to that team).
+Getting the objects: `vessel.ActiveController().WM` (namespace `BDArmory.Extensions`) for the weapon manager; `wm.AI as BDGenericAIBase` (or `vessel.FindPartModuleImplementing<BDModulePilotAI>()` etc.) for the AI; `vessel.GetComponent<TargetInfo>()` for a vessel's target record (or iterate `BDATargetManager.TargetList(wm.Team)`, the targets known to that team).
+
+**Use the primary weapon manager.** A vessel can carry several `MissileFire` modules, but only the primary one (`wm.IsPrimaryWM`, the one `vessel.ActiveController().WM` returns) runs guard mode, and `ModuleWeapon`'s fire-authority gate reads the primary one too. Hooks set on a secondary weapon manager are stored but have no effect. `vessel.FindPartModuleImplementing<MissileFire>()` returns the first module found, which is not necessarily the primary. The primary can change (the part holding it is destroyed or decoupled), so check `IsPrimaryWM` when you re-issue orders and set the hooks again on the new primary.
 
 ## 3. F1: external target assignment
 
@@ -98,7 +100,7 @@ public bool        IsExternallyAssigned(TargetInfo target)       // live assignm
 public bool        TargetOverride { get; }                       // stock getter: overrideTimer > 0
 
 // BDArmory.Control
-public enum OverrideLostReason { None = 0, Expired, Cleared, Replaced, TargetDestroyed, NotEngageable, Filtered }
+public enum OverrideLostReason { None = 0, Expired, Cleared, Replaced, TargetDestroyed, NotEngageable, Filtered, NotHostile }   // new values are only ever appended
 ```
 
 The stock `public void SetOverrideTarget(TargetInfo target)` is unchanged in signature.
@@ -108,7 +110,7 @@ The stock `public void SetOverrideTarget(TargetInfo target)` is unchanged in sig
 - **Duration.** `durationS` is converted by `FireAuthorityRules.ExternalOverrideTimer`: a positive finite value is used as is; `<= 0` or `NaN` becomes `+Infinity` (until cleared).
 - **The duration is game time.** The expiry is stored as `Time.time + durationS` and checked every `FixedUpdate` of the weapon manager, whether guard mode is on or not (guard off, not controllable, `PEACE_MODE`, GuardMode early returns: the clock keeps running). Target loss (`TargetDestroyed`) is checked at the same place. An assignment can therefore expire, and raise `Expired`, while guard mode is off.
 - **Survives missile routines.** The timer is set when the assignment is made, so the stock "null the override at the end of GuardMode when `overrideTimer <= 0`" does not apply, even while `guardFiringMissile` skips target scans.
-- **Takes effect at the next guard tick.** `SetOverrideTarget` forces a target scan (`targetScanTimer = -100`). The assignment is stored even when guard mode is off and acted on once it is on. No team or hostility check is made on the target: that is the caller's job.
+- **Takes effect at the next guard tick.** `SetOverrideTarget` forces a target scan (`targetScanTimer = -100`). The assignment is stored even when guard mode is off and acted on once it is on. No team or hostility check is made when the assignment is made: that is the caller's job. At each scan, though, an assignment on a vessel that is not an enemy of this weapon manager's team (own team, allied or neutral, typically after a team change) is dropped with `NotHostile`, so a missile is never launched at a now-friendly vessel.
 - **Priority.** At each scan the assignment is examined first, before missile threats and the normal queries. It also bypasses the stock early returns "keep current target, about to enter gun range" and "max targets fired on with LASMs, keep target painted", which would otherwise keep the old target.
 - **`TargetOverride` stays `true`** while an external assignment is live (the timer is above zero or infinite). `BDModulePilotAI` checks it (`BDModulePilotAI.cs` around `weaponManager.TargetOverride`, "Target is overridden, follow others' instructions") and so does not extend away from the target on its own.
 - **Engageable vs sticky.** At each scan `SmartPickWeapon_EngagementEnvelope(target)` decides whether any weapon can engage it.
@@ -128,7 +130,8 @@ The stock `public void SetOverrideTarget(TargetInfo target)` is unchanged in sig
 | `Expired` | The game-time expiry passes (only finite durations); checked every `FixedUpdate`, guard mode on or off. |
 | `Cleared` | `ClearExternalOverride()` with a live assignment, or `SetOverrideTarget(null, ...)`. No event if there is no live assignment. |
 | `Replaced` | `SetOverrideTarget(otherTarget, d, s)` while a different external assignment is live, or the stock `SetOverrideTarget(TargetInfo)` while any external assignment is live. Re-assigning the *same* target with the 3-argument overload raises nothing: it just refreshes duration and stickiness. |
-| `TargetDestroyed` | `overrideTarget` is Unity-null (vessel died or the `TargetInfo` was destroyed). Checked every `FixedUpdate` and at the start of each override check in the scan. |
+| `TargetDestroyed` | `overrideTarget` is Unity-null (vessel died or the `TargetInfo` was destroyed). Checked every `FixedUpdate` and at the start of each override check in the scan. A team change of the target also lands here: `SetTeam` destroys and recreates the vessel's `TargetInfo`, so the assigned record is gone. |
+| `NotHostile` | At a scan, the target (a vessel, not a missile) is no longer an enemy of this weapon manager's team: own team, allied or neutral, for example after this weapon manager's vessel changed team. |
 | `NotEngageable` | Non-sticky assignment, no weapon can engage the target at a scan. |
 | `Filtered` | `ExternalTargetFilter` rejects the target at a scan. |
 
@@ -152,12 +155,12 @@ public IReadOnlyList<TargetInfo> ExternalSecondarySnapshot { get; }     // last 
 - **Secondary assignment** only happens when `multiTargetNum > 1 || multiMissileTgtNum > 1` and there is a primary target, in `SmartFindSecondaryTargets()`.
   - External entries come first, in the order returned (index 0 is highest priority), then BDArmory's own picks fill what is left.
   - Caps are the same as stock: vessels up to `max(Max Turret Targets, Max Missile Tgts)`; missile targets only if `targetMissiles` is on and `Max Turret Targets > 1`, up to `Max Turret Targets`. Entries over the cap are skipped silently.
-  - Skipped entries: `null`, no `Vessel`, the weapon manager's own vessel, duplicates, anything the primary already is, and anything `IsTargetFilteredOut` rejects (the filter wins).
-  - Hostility and visibility are **not** checked on external entries.
+  - Skipped entries: `null`, no `Vessel`, the weapon manager's own vessel, vessels that are not enemies of this weapon manager's team (own team, allied or neutral; checked when the snapshot is taken), duplicates, anything the primary already is, and anything `IsTargetFilteredOut` rejects (the filter wins).
+  - Visibility is **not** checked on external entries, and hostility only as above (missiles are kept).
 - **`ExternalSecondaryTargetsOnly`** = true suppresses BDArmory's own picks, but only at scans where the delegate actually returned a list (an empty list counts). If the delegate is null, returns `null` or throws, BDArmory's own picks are used as normal for that scan.
 - **The list is copied** into an internal snapshot every scan and never stored, so you can return one reusable pre-allocated `List<TargetInfo>`.
 - **Exceptions** in the delegate are caught and logged once per weapon manager (`ExternalSecondaryTargets threw (stock picks used; logged once per weapon manager)`); the scan proceeds with no external entries and the stock picks.
-- **Fire authority.** Under `Tight`, snapshot members count as assigned (authorised) even when they did not make it into the capped secondary list.
+- **Fire authority.** Under `Tight`, snapshot members count as assigned (authorised) even when they did not make it into the capped secondary list. Non-hostile entries are not in the snapshot, so it never authorises them.
 
 ## 5. F3: fire authority
 
@@ -179,7 +182,7 @@ public bool FireAuthorityPermits(Vessel targetVessel, bool isProjectile = false)
 
 ### Gated code paths
 
-- `ModuleWeapon.CheckAIAutofire` (end of the method, `ModuleWeapon.cs`, tag `Overdrive F3`): for AI-controlled weapons (`autoFire && aiControlled`) of a weapon manager that is not `Free`, `autoFire` is forced `false` and `autoFireFailReason` is set to `"Weapons hold"` or `"Weapons tight"`. The target vessel comes from `FireAuthorityTargetVessel` (slaved target, targeting-pod lock, else `visualTargetVessel` / `lastVisualTargetVessel`). `isProjectile` is true only for APS weapons engaging a shell or rocket. This gate applies **whether or not guard mode is on**, but only to AI-controlled fire, not to a human holding the trigger.
+- `ModuleWeapon.CheckAIAutofire` (end of the method, `ModuleWeapon.cs`, tag `Overdrive F3`): for AI-controlled weapons (`autoFire && aiControlled`) of a weapon manager that is not `Free`, `autoFire` is forced `false` and `autoFireFailReason` is set to `"Weapons hold"` or `"Weapons tight"`. The target vessel comes from `FireAuthorityTargetVessel` (slaved target, targeting-pod lock, else `visualTargetVessel` / `lastVisualTargetVessel`). Its `TargetInfo` is looked up through a small per-weapon-manager cache (8 vessels, compared by reference, refetched when the cached record was destroyed or reassigned), so `Tight` doesn't call `TryGetComponent` per weapon per frame. `isProjectile` is true only for APS weapons engaging a shell or rocket. This gate applies **whether or not guard mode is on**, but only to AI-controlled fire, not to a human holding the trigger.
 - `MissileFire.GuardMode`, missile branch: under `Hold` neither a normal launch nor a parallel salvo (`GuardParallelSalvoRoutine`) is started.
 - `MissileFire.GuardMode`, bomb branch: `GuardFireBlocked(guardTarget)` prevents `GuardBombRoutine`.
 - `MissileFire.GuardMissileLaunchAuthorized`: returns false unless `FireAuthorityPermits(target)` (used by the normal path and per target in the parallel salvo).
@@ -256,7 +259,9 @@ Existing members still apply: `ClearWaypoints()`, `IsRunningWaypoints`, `Current
 - `radiusM`: gate radius for points without their own radius; `<= 0` means 500 m. `radii`: optional per-point radius; a missing entry or an entry `<= 0` falls back to `radiusM`.
 - `laps`: clamped to at least 1.
 - `maxSpeeds`: optional per-point speed limit (m/s) applied to the AI's max speed (`BDModulePilotAI.maxSpeed` / `BDModuleSurfaceAI.MaxSpeed` / `BDModuleVTOLAI.MaxSpeed`) when heading for that point. An entry `<= 0` or missing means the AI's own max speed. The AI's max speed at the start of the route is saved and **restored** when the route ends (completion, `ClearWaypoints()`, or a new `SetWaypoints`), but only if `maxSpeeds` was non-empty.
-- **Gate reached:** same geometry as stock (inside the radius and at closest approach this physics step). Raises `OnCustomWaypointReached(ai, index, lap)` (index and lap of the gate just passed), then moves on. Raising is wrapped in `try/catch`.
+- **Gate reached:** same geometry as stock (inside the radius and at closest approach this physics step). Raises `OnCustomWaypointReached(ai, index, lap)` (index and lap of the gate just passed), then moves on. Raising is wrapped in `try/catch`. Overlapping gates can be passed in the same physics step, at most one lap's worth (a loop, not recursion, so huge lap counts are safe); the rest wait for the next step.
+- **Single-point routes:** after its one gate is passed, the gate only counts again once the vessel has left its radius (otherwise a hovering or slow vessel would pass a lap every frame).
+- **Handlers may change the route.** If an `OnCustomWaypointReached` handler calls `SetWaypoints` (either overload) or `ClearWaypoints()`, the new state is left alone: the rest of the old route's processing, including its completion on the last gate, is skipped (no `OnCustomWaypointRouteCompleted` for the replaced route).
 - **Completion** (after the last gate of the last lap): `waypoints` cleared, speed restored, command released, then if `guardAtEnd` and the vessel has a weapon manager with guard mode off, guard mode is switched on; finally `OnCustomWaypointRouteCompleted(ai)` is raised. The last gate also raises `OnCustomWaypointReached` first.
 - **Not a competition run:** no `Scores.RegisterWaypointReached`, no waypoint-course scoring, and `BDACompetitionMode.CullSlowWaypointRunners` skips custom routes. `WAYPOINT_GUARD_INDEX` is ignored (use `guardAtEnd`). The AI status line shows laps only when `laps > 1` and no course gate name.
 - **Return value.** `false` if `points` is null/empty (this also calls `ClearWaypoints()`), or if the AI is not active (`pilotEnabled` is false). In the `pilotEnabled == false` case nothing is changed (any running route continues); call `SetWaypoints` again once the AI is active.
@@ -269,7 +274,8 @@ Existing members still apply: `ClearWaypoints()`, `IsRunningWaypoints`, `Current
 // BDArmory.Control.BDGenericAIBase
 public bool    waypointsYieldToCombat = false;   // break off waypoints to attack the guard target
 public float   patrolLeashDistance = 0f;         // metres from the anchor while engaging; 0 = unlimited
-public Vector3d patrolAnchor = Vector3d.zero;    // (latitude, longitude, altitude ASL); zero = the current waypoint
+public Vector3d patrolAnchor = Vector3d.zero;    // (latitude, longitude, altitude ASL); zero = where the engagement began
+public Vector3d PatrolLeashAnchor { get; }       // the current engagement's anchor (lat, lon, alt ASL); zero when not engaged
 public float   patrolLeashCooldown = 30f;        // seconds a leash-broken target is ignored for patrol engagement
 public bool    PatrolEngaged { get; }
 public Vessel  PatrolTarget { get; }
@@ -281,11 +287,12 @@ public static event System.Action<BDGenericAIBase, bool>   OnPatrolResume;  // (
 
 **Behaviour** (pilot AI, `waypointsYieldToCombat = true`, waypoints running, guard mode on, not `PEACE_MODE`):
 
-- When the weapon manager has a target and fire authority allows it, the AI skips its waypoint steering and runs its normal attack logic. `PatrolEngaged` becomes true and `OnPatrolEngage(ai, target)` is raised (again if the target changes).
+- When the weapon manager has a target, fire authority allows it and the vessel has weapons with ammo (`MissileFire.HasWeaponsAndAmmo()`), the AI skips its waypoint steering and runs its normal attack logic. `PatrolEngaged` becomes true and `OnPatrolEngage(ai, target)` is raised (again if the target changes). An unarmed or out-of-ammo vessel stays on its route instead of ramming or orbiting with its waypoint frozen; running out of ammo mid-chase resumes the route.
 - While engaged the waypoint state (index, lap) is frozen: no gate is passed or skipped. When the target is gone (killed, lost, deselected), or the flag is cleared, the AI resumes **the same waypoint** and `OnPatrolResume(ai, false)` is raised.
 - **Fire authority.** `Hold` never yields (the AI stays on its waypoints). `Tight` yields only for targets `FireAuthorityPermits` (externally assigned, or passing the `ExternalTargetFilter`). `Free` yields for any target the weapon manager selected.
-- **Leash.** With `patrolLeashDistance > 0`, if the vessel gets farther than that from the anchor (`patrolAnchor`, or the current waypoint when zero) while engaging, it breaks off: `OnPatrolResume(ai, true)`, the target is ignored for patrol engagement for `patrolLeashCooldown` seconds, and if that target was the F1 external assignment the assignment is cleared (reason `Cleared`) so it is not pulled straight back. The weapon manager may keep the target selected and still fire at it opportunistically while the AI flies the pattern.
-- Waypoints ending (completed, cleared, replaced) end the engagement with `OnPatrolResume(ai, false)`.
+- **Leash anchor.** `patrolAnchor` if set; otherwise the point where the engagement began (where the AI left its route), stored as latitude, longitude and altitude so floating-origin shifts during a long chase don't move it. An engagement that starts within 10 s of the previous resume reuses the previous anchor, so back-to-back chases can't creep away from the route. The anchor is forgotten when the waypoints stop or the AI is switched off. `PatrolLeashAnchor` exposes it. The current waypoint is deliberately not the anchor: on long legs the vessel can be farther than the leash from its next waypoint before it engages, so every chase would break at once.
+- **Leash.** With `patrolLeashDistance > 0`, if the vessel gets farther than that from the anchor while engaging, it breaks off: `OnPatrolResume(ai, true)`, the target is ignored for patrol engagement for `patrolLeashCooldown` seconds, and if that target was the F1 external assignment the assignment is cleared (reason `Cleared`) so it is not pulled straight back. The weapon manager may keep the target selected and still fire at it opportunistically while the AI flies the pattern.
+- Waypoints ending (completed, cleared, replaced), another command replacing the waypoints (follow, attack position, release), or the AI being deactivated end the engagement with `OnPatrolResume(ai, false)`.
 - Defaults (`false`, 0) are stock behaviour; nothing is evaluated while `waypointsYieldToCombat` and `PatrolEngaged` are false.
 
 ### Stay on task vs engage on contact
@@ -306,20 +313,29 @@ public ViewScanResults LastScan { get; }   // MissileFire; copy of the struct fr
 
 ### OD1: multi-spawn (user feature)
 
-A user-facing feature of the Vessel Mover window ("Multi-spawn options" section): spawn N copies of a craft in a line (abreast or in trail, wrapping into rows), with clear-space finding, on the ground, at sea or in the air. A count above 1, or "Spawn in the air", routes the Spawn button through `VesselMover.MultiSpawnVessels`; count 1 on the surface is the unchanged stock flow (including the crew chooser, which is skipped for multi-spawn). Skizzy can drive it by setting these persistent settings (`BDArmory.Settings.BDArmorySettings`, saved with the other BDA settings) and then triggering the spawn from the window:
+A user-facing feature of the Vessel Mover window ("Multi-spawn options" section): spawn N copies of a craft in a line (abreast or in trail, wrapping into rows), with clear-space finding, on the ground, at sea or in the air. A count above 1, or "Spawn in the air", routes the Spawn button through `VesselMover.MultiSpawnVessels`; count 1 on the surface is the unchanged stock flow (including the crew chooser, which is skipped for multi-spawn). Skizzy can drive it by setting these settings (`BDArmory.Settings.BDArmorySettings`) and then triggering the spawn from the window. The layout options are saved with the other BDA settings. The count and the air toggle are **session-only** (back to 1 and off after a restart), so a later session never multi-spawns or air-spawns by surprise. An older BDArmory DLL ignores the new keys in `settings.cfg`.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `int VESSEL_MOVER_SPAWN_COUNT` | 1 | Copies to spawn; no cap, a warning above 50 |
+| `int VESSEL_MOVER_SPAWN_COUNT` | 1 | Copies to spawn; no cap, a warning above 50. Not saved |
 | `bool VESSEL_MOVER_SPAWN_TRAIL` | false | In trail (along the heading) instead of abreast |
 | `float VESSEL_MOVER_SPAWN_SPACING` | 0 | Metres between copies; 0 = auto from craft size plus margin |
 | `int VESSEL_MOVER_SPAWN_PER_ROW` | 0 | Copies per row; 0 = auto (wrap at 2 km) |
 | `float VESSEL_MOVER_SPAWN_HEADING` | 90 | Heading of the line's craft in degrees |
-| `bool VESSEL_MOVER_SPAWN_AIR` | false | Spawn in the air |
+| `bool VESSEL_MOVER_SPAWN_AIR` | false | Spawn in the air. Not saved |
 | `float VESSEL_MOVER_SPAWN_ALTITUDE` | 1000 | Air spawn altitude above sea level, metres |
 | `float VESSEL_MOVER_SPAWN_SPEED` | 0 | Air spawn initial speed, m/s; 0 = the pilot AI's idle speed |
 
-`public static bool VesselMover.MultiSpawnRequested` is true when the count is above 1 or `VESSEL_MOVER_SPAWN_AIR` is set. The pure layout logic is `BDArmory.VesselSpawning.MultiSpawnLayout` (`Plan(...)`, `PerRow`, `AutoSpacing`, ...), with `MultiSpawnStatus` { `Placed`, `Shifted`, `Moved`, `NoClearSpace`, `InvalidCount` }. There is no public method that starts a spawn without the window's click-to-place step; the spawn point is chosen by clicking on the map/terrain as for the single spawn. Spawns are staggered over frames; copies get unique names through the normal name deconfliction (only vessels with a weapon manager are renamed). The algorithm is documented in `skizzy-protocol/design/06-flight-control.md` section 9.1.
+`public static bool VesselMover.MultiSpawnRequested` is true when the count is above 1 or `VESSEL_MOVER_SPAWN_AIR` is set. The pure layout logic is `BDArmory.VesselSpawning.MultiSpawnLayout` (`Plan(...)`, `PerRow`, `AutoSpacing`, ...), with `MultiSpawnStatus` { `Placed`, `Shifted`, `Moved`, `NoClearSpace`, `InvalidCount`, `Wrapped` } (new values are only appended). There is no public method that starts a spawn without the window's click-to-place step; the spawn point is chosen by clicking on the map/terrain as for the single spawn. Spawns are staggered over frames; copies get unique names through the normal name deconfliction (only vessels with a weapon manager are renamed). The algorithm is documented in `skizzy-protocol/design/06-flight-control.md` section 9.1.
+
+**Clear-space search** (`MultiSpawnLayout.Plan(count, direction, spacing, rowSpacing, perRow, minSeparation, isFree, maxRings = 8, maxSearchRadius = 5000, minSearchReach = 2000, maxRowLength = 2000, maxChecks = 0)`), in order:
+
+1. The requested layout at the clicked point, with each blocked slot shifted along its row (`Placed` or `Shifted`).
+2. **Wrap rule** (`Wrapped`): when the line doesn't fit as laid out (a narrow strip of land, a pier, a corridor between buildings), the copies are re-flowed into shorter rows that follow the clear ground. Abreast: each row fills outward from the centre line, alternating sides; a side closes at a blocked slot that can't be shifted or at half the maximum row length, and further rows stack behind. Trail: each column runs backward along the heading up to the maximum row length, with columns at 0, +1, -1, +2, ... row spacings to the side. It fails on an empty row or when it would need more than `MaxWrappedRows(count, perRow)` rows (the larger of twice the requested rows and the requested rows + 3).
+3. Ring search around the clicked point (`Moved`): each ring position tries the requested layout, then the wrap rule (`plan.wrapped`). The search reaches at least `minSearchReach` (2 km) whatever the craft size: the ring step is the natural step (the layout's size plus spacing) unless reaching 2 km within `maxRings` would take more than 16 rings, in which case the step grows. `maxSearchRadius` (5 km) caps it; large formations use the natural step out to 5 km.
+4. Otherwise `NoClearSpace`, with `plan.searchReach` (metres searched) and `plan.bestFreeSlots`.
+
+Each distinct position is checked once (results are memoised to the centimetre), and the search stops after `maxChecks` clear-space checks (0: `DefaultCheckBudget(count)`, the larger of 20000 and 50 per copy; see `plan.checkBudgetExhausted` and `plan.checks`). In the game the clear-space check tests land/water and air clearance first, then the loaded vessels (collected once per spawn), and only then the slope grid, building raycasts and air path. The window shows "finding clear space..." while it runs.
 
 ## 10. F8-F11 (P1)
 
@@ -332,9 +348,10 @@ public static event Action<MissileFire, MissileBase, Vessel> OnMissileFired;   /
 ```
 
 - `FireMissileAt` refuses (returns false) a null missile, a missile not on this vessel, or one already launched; and EMP/nuclear warheads while guard mode is on without a current target (the blast stand-off logic needs one). Otherwise it goes through the normal `FireCurrentMissile` path: fire authority applies while guard mode is on; with `checkClearance` a blocked missile can be swapped for an identical one with clearance (stock behaviour).
-- `OnMissileFired` is raised after a launch through `FireCurrentMissile` (guard mode, manual fire, `FireMissileAt`) and the parallel salvo. For rails and turrets the reported missile is the one asked for; the mount may launch its ready missile instead. Missiles fired by other mods' code paths are not reported.
+- `FireMissileAt` returns true only when a missile actually launched. A rotary rail refuses any missile but its ready one: that returns false and raises nothing.
+- `OnMissileFired` is raised after a real launch (the missile is `launched` or `HasFired`) through `FireCurrentMissile` (guard mode, manual fire, `FireMissileAt`) and the parallel salvo. With `checkClearance` the reported missile is the one that launched (possibly the identical swapped one). Missiles fired by other mods' code paths are not reported.
 
-### F10: game events (done, partial coverage of target loss)
+### F10: game events (done)
 
 ```csharp
 // BDArmory.Competition.CompetitionScores
@@ -345,12 +362,13 @@ public static event Action OnCompetitionStarted;
 public static event Action OnCompetitionEnded;
 // BDArmory.UI.BDATargetManager
 public static event Action<TargetInfo, BDTeam> OnTargetDetected;   // first added to that team's target database
-public static event Action<TargetInfo, BDTeam> OnTargetLost;       // explicitly removed from that team's database
+public static event Action<TargetInfo, BDTeam> OnTargetLost;       // removed from that team's database (explicitly or by the 5 s clean-up)
 ```
 
 - `OnHit` and `OnDeath` are only raised for scored events, i.e. during a competition (the `Register*` methods return early otherwise). Vessel names are the scoring names.
-- `OnTargetLost` covers `RemoveTarget` calls; the periodic clean-up that drops null, same-team or non-threat targets from the lists is not reported. Treat `OnTargetDetected` as "new contact for the team" and poll `TargetList(team)` for an exact view.
-- All are static, null-checked, raised synchronously on the main thread, and handler exceptions are caught and logged.
+- `OnCompetitionEnded` is paired with `OnCompetitionStarted`: it is raised only when a started competition stops, not for the `StopCompetition` calls BDArmory makes on scene changes, failed starts or cancelled start sequences.
+- `OnTargetLost` covers `RemoveTarget` calls (vessel died, changed team, GM kill) and the periodic clean-up (every 5 s) that drops destroyed, same-team and non-threat targets. The target may already be destroyed (Unity-null; compare with `ReferenceEquals` if you keyed a dictionary on it). Events are raised after BDArmory has finished walking the database, so a handler may query or change it. `ClearDatabase` (scene start, competition reset) is not reported. The clean-up collects the removals only while a handler is subscribed; otherwise it runs the stock code. Treat `OnTargetDetected` as "new contact for the team" and poll `TargetList(team)` for an exact view.
+- All are static, null-checked, raised synchronously on the main thread, and handler exceptions are caught and logged. Unsubscribe when your plugin's scene object is destroyed: a static event keeps its handlers (and what they capture) alive across scenes.
 
 ### F8 (not done)
 
@@ -362,8 +380,6 @@ Skipped in this pass.
 
 ## 11. Recipes
 
-## 11. Recipes
-
 All snippets compile against the real signatures (checked with `csc` against the KSP assemblies and a build of this branch).
 
 ```csharp
@@ -371,6 +387,7 @@ using System;
 using System.Collections.Generic;
 using UnityEngine;
 using BDArmory.Control;
+using BDArmory.Extensions;
 using BDArmory.Radar;
 using BDArmory.Targeting;
 using BDArmory.UI;
@@ -379,8 +396,11 @@ using BDArmory.UI;
 **Assign a sticky target for 60 s and react to loss**
 
 ```csharp
-static void AssignSticky(MissileFire wm, Vessel enemy)
+static void AssignSticky(Vessel unit, Vessel enemy)
 {
+    var controller = unit.ActiveController();      // BDArmory.Utils.ActiveController (a VesselModule)
+    var wm = controller != null ? controller.WM : null;   // the primary weapon manager
+    if (wm == null) return;
     var target = enemy.GetComponent<TargetInfo>();
     if (target == null) return;
     MissileFire.OnExternalOverrideLost -= OnLost;   // avoid double subscription
@@ -392,7 +412,8 @@ static void OnLost(MissileFire wm, TargetInfo target, OverrideLostReason reason)
 {
     Debug.Log($"[Adapter] {wm.vessel.vesselName} lost {(target != null && target.Vessel != null ? target.Vessel.vesselName : "(gone)")}: {reason}");
     // Expired: re-issue if the order still stands. Replaced/Cleared: someone else (or we) changed it.
-    if (reason == OverrideLostReason.Expired && target != null) wm.SetOverrideTarget(target, 60f, true);
+    if (reason == OverrideLostReason.Expired && target != null && wm.IsPrimaryWM) wm.SetOverrideTarget(target, 60f, true);
+    // NotHostile: the target (or this unit) changed team. TargetDestroyed: dead, or its TargetInfo was recreated by a team change.
 }
 ```
 
@@ -473,7 +494,7 @@ static void ReadContacts(MissileFire wm)
 
 ## 12. Performance
 
-- No per-frame allocations are added by the hooks. The F1 events and F2 snapshot reuse preallocated collections; `FireAuthorityPermits(Vessel, bool)` uses `TryGetComponent` (no allocation); the F5 accessors return the existing lists.
+- No per-frame allocations are added by the hooks. The F1 events and F2 snapshot reuse preallocated collections; `FireAuthorityPermits(Vessel, bool)` uses a small preallocated cache, with `TryGetComponent` (no allocation) on a miss; the F10 target-lost queue is a reused static list; the F5 accessors return the existing lists.
 - Unused cost: one null check or enum comparison at each gate (`ExternalTargetFilter == null && fireAuthority != Tight`; `fireAuthority != Free`; `externalOverride`; `ExternalSecondaryTargets != null || externalSecondaryList.Count > 0`).
 - Your delegates:
   - `ExternalTargetFilter` is the hot one: it can run several times per candidate target per weapon manager per scan, and from `GetGuardNonTarget` on the AI update. No LINQ, no string building, no allocations, no logging, no KSP calls that search the scene, and never block.
