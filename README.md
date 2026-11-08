@@ -104,6 +104,11 @@ This mod for Kerbal Space Program was originally developed by Paolo Encarnacion 
 distributed under the license CC-BY-SA 2.0. It was then maintained in BahamutoD's absence by Joe
 Korinek (Papa_Joe) and continues to be distributed under the license CC-BY-SA 2.0. BDArmory
 Overdrive's changes are distributed under the same license, CC-BY-SA 2.0.
+
+**Credit.** CC-BY-SA 2.0 requires attribution. When you redistribute BDArmory Overdrive or a work
+based on it, credit: "BDArmory by Paolo Encarnacion (BahamutoD), maintained by Joe Korinek
+(Papa_Joe) and the BDArmory Continued team; Overdrive changes by Skizzy-create"
+(https://github.com/Skizzy-create/BDArmory).
 Please read about the license at https://creativecommons.org/licenses/by-sa/2.0/ before
 attempting to modify and redistribute it. The full notice, including the Firespitter
 permission notice, is in `BDArmory/Distribution/GameData/BDArmory/License.txt` (shipped as
