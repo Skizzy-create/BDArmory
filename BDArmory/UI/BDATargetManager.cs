@@ -1414,6 +1414,7 @@ namespace BDArmory.UI
                 {
                     if (target.Current == null || !target.Current.Vessel || target.Current.isLandedOrSurfaceSplashed || target.Current.isMissile || !target.Current.isThreat) continue;
                     if (target.Current.WeaponManager == null) continue;
+                    if (mf.IsTargetFilteredOut(target.Current)) continue; // [Overdrive F4]
                     Vector3 targetRelPos = target.Current.Vessel.vesselTransform.position - mf.vessel.vesselTransform.position;
 
                     float distance, dot;
@@ -1501,6 +1502,7 @@ namespace BDArmory.UI
                     if (target.Current == null) continue;
                     if (target.Current.WeaponManager == null) continue;
                     //if (mf.IsTargetExcluded(target.Current)) continue;
+                    if (mf.IsTargetFilteredOut(target.Current)) continue; // [Overdrive F4]
                     if (target.Current && target.Current.Vessel && mf.CanSeeTarget(target.Current, true, true) > 0 && !excluding.Contains(target.Current) && target.Current.SafeOrbitalIntercept(mf))
                     {
                         finalTargets.Add(target.Current);
@@ -1647,6 +1649,7 @@ namespace BDArmory.UI
                     if (exclude != null && exclude.Contains(t)) continue;
                     var targetMf = t.WeaponManager;
                     if (targetMf == null) continue;
+                    if (mf.IsTargetFilteredOut(t)) continue; // [Overdrive F4]
                     var tgtVisibility = mf.CanSeeTarget(t, true, true);
                     if (tgtVisibility < MissileFire.TargetVisibility.RecentlyVisible || !t.SafeOrbitalIntercept(mf)) continue;
                     if (t.isThreat)

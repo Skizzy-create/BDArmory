@@ -5248,6 +5248,29 @@ namespace BDArmory.Weapons
                     autoFireFailReason = "APS threat direction";
                 }
             }
+            // [Overdrive F3] Fire authority of the weapon manager (AI-controlled fire only; Free is stock).
+            if (autoFire && aiControlled)
+            {
+                var authorityWM = WeaponManager;
+                if (authorityWM != null && authorityWM.fireAuthority != FireAuthority.Free && !authorityWM.FireAuthorityPermits(FireAuthorityTargetVessel(authorityWM), isAPS && (tgtShell != null || tgtRocket != null)))
+                {
+                    autoFire = false;
+                    autoFireFailReason = authorityWM.fireAuthority == FireAuthority.Hold ? "Weapons hold" : "Weapons tight";
+                }
+            }
+        }
+
+        /// <summary>
+        /// [Overdrive F3] The vessel this weapon is engaging, for the fire authority check.
+        /// </summary>
+        Vessel FireAuthorityTargetVessel(MissileFire wm)
+        {
+            if (targetAcquisitionType == TargetAcquisitionType.Slaved)
+            {
+                if (wm.slavedTarget.vessel != null) return wm.slavedTarget.vessel;
+                if (wm.mainTGP != null && wm.mainTGP.lockedVessel != null) return wm.mainTGP.lockedVessel;
+            }
+            return visualTargetVessel != null ? visualTargetVessel : lastVisualTargetVessel;
         }
 
         /// <summary>

@@ -430,7 +430,219 @@ namespace BDArmory.Control
         /// Previously targetsAssigned (the secondary targets list) doubled as the exclusion list, which got overwritten by SetTarget part-way through target selection
         /// and made AI queries outside of target selection skip every secondary target.
         /// </summary>
-        public bool IsTargetExcluded(TargetInfo target) => activeTargetExclusions != null && target != null && activeTargetExclusions.Contains(target);
+        public bool IsTargetExcluded(TargetInfo target) => target != null && ((activeTargetExclusions != null && activeTargetExclusions.Contains(target)) || IsTargetFilteredOut(target));
+
+        #region Overdrive integration hooks (F1-F4, F12)
+        // All hooks are inert by default: with no external consumer setting them, every code path behaves as stock BDArmory.
+        // See Overdrive/HOOKS.md for the public API reference.
+
+        /// <summary>
+        /// [Overdrive F1/F4] External target filter (rules of engagement, zones). Return false to stop this weapon manager selecting the target.
+        /// Consulted for vessel targets only (never for missiles, so point defence always works), in the override check, in SmartFindTarget's
+        /// BDATargetManager queries, in the secondary target lists and by the AI's GetGuardNonTarget. Null (the default) means no filtering.
+        /// Called on the main thread, possibly many times per target scan: keep it cheap and allocation-free.
+        /// </summary>
+        public Func<MissileFire, TargetInfo, bool> ExternalTargetFilter;
+
+        /// <summary>
+        /// [Overdrive F2] External secondary targets. Called once per target scan; the returned targets (in priority order) are assigned as
+        /// secondary targets first, before BDArmory's own picks, still capped by Max Turret Targets / Max Missile Tgts. Return null to use the stock picks only.
+        /// BDArmory copies the list immediately and never stores the returned instance, so a consumer can reuse one pre-allocated list.
+        /// </summary>
+        public Func<MissileFire, IList<TargetInfo>> ExternalSecondaryTargets;
+
+        /// <summary>
+        /// [Overdrive F2] When true (and ExternalSecondaryTargets returns a list), BDArmory doesn't add its own secondary picks after the external ones.
+        /// </summary>
+        public bool ExternalSecondaryTargetsOnly = false;
+
+        /// <summary>
+        /// [Overdrive F3] Fire authority. Free (default) is stock behaviour. Tight: fire only at external assignments, targets passing the
+        /// ExternalTargetFilter, and missiles (self-defence); unassigned vessels are also skipped by target selection when no filter is set.
+        /// Hold: keep scanning, targeting and locking, but never fire (guns, rockets, lasers, missiles, bombs, interceptors).
+        /// Applies while guard mode is on.
+        /// </summary>
+        public FireAuthority fireAuthority = FireAuthority.Free;
+
+        /// <summary>[Overdrive F1] Raised when an external assignment ends for any reason. Not raised for stock (team-assist) overrides.</summary>
+        public static event Action<MissileFire, TargetInfo, OverrideLostReason> OnExternalOverrideLost;
+
+        bool externalOverride = false; // The current overrideTarget was set by SetOverrideTarget(target, durationS, sticky).
+        bool externalOverrideSticky = false;
+        readonly HashSet<TargetInfo> externalSecondarySet = []; // Snapshot of the last ExternalSecondaryTargets result (for Tight authority checks).
+        readonly List<TargetInfo> externalSecondaryList = []; // Same, in priority order.
+
+        /// <summary>[Overdrive F1] Whether an external assignment is live.</summary>
+        public bool HasExternalOverride => externalOverride && overrideTarget != null;
+        /// <summary>[Overdrive F1] The live external assignment, or null.</summary>
+        public TargetInfo ExternalOverrideTarget => externalOverride ? overrideTarget : null;
+        /// <summary>[Overdrive F1] Whether the live external assignment is sticky.</summary>
+        public bool ExternalOverrideSticky => externalOverride && externalOverrideSticky;
+        /// <summary>[Overdrive F1] Seconds left on the live external assignment (+Infinity until cleared, 0 when none). Counts down while guard mode runs.</summary>
+        public float ExternalOverrideTimeRemaining => externalOverride ? Mathf.Max(0f, overrideTimer) : 0f;
+        /// <summary>[Overdrive F1] Whether a weapon could engage the external assignment at the last target scan (false while a sticky assignment is out of every envelope).</summary>
+        public bool ExternalOverrideEngageable { get; private set; } = false;
+        /// <summary>[Overdrive F1] Why the last external assignment ended.</summary>
+        public OverrideLostReason LastOverrideLostReason { get; private set; } = OverrideLostReason.None;
+        /// <summary>[Overdrive F1] The target of the last external assignment that ended (may be destroyed).</summary>
+        public TargetInfo LastOverrideLostTarget { get; private set; } = null;
+        /// <summary>[Overdrive F1] Time.time when the last external assignment ended.</summary>
+        public float LastOverrideLostTime { get; private set; } = 0f;
+        /// <summary>[Overdrive F1] Number of team-assist overrides blocked because an external assignment was live.</summary>
+        public int TeamAssistOverridesBlocked { get; private set; } = 0;
+        /// <summary>[Overdrive F2] The last snapshot of ExternalSecondaryTargets (read-only view; empty when unused).</summary>
+        public IReadOnlyList<TargetInfo> ExternalSecondarySnapshot => externalSecondaryList;
+        /// <summary>[Overdrive F12] The last guard view scan results (incoming missiles, gun threats).</summary>
+        public ViewScanResults LastScan => results;
+
+        /// <summary>
+        /// [Overdrive F1] Assign a target from an external controller. Unlike the stock SetOverrideTarget(target):
+        /// - the assignment lives for durationS seconds of guard mode (0 or less: until cleared), including through missile routines (guardFiringMissile);
+        /// - sticky: it stays the target while no weapon can engage it (the AI keeps closing); non-sticky: it's dropped at the first scan where no weapon can engage it (stock);
+        /// - BDArmory's team assist can't overwrite it;
+        /// - the ExternalTargetFilter still applies (a rejected target is dropped with reason Filtered).
+        /// A null target clears the assignment. Raises OnExternalOverrideLost (Replaced) for a live assignment to a different target that this replaces.
+        /// </summary>
+        public void SetOverrideTarget(TargetInfo target, float durationS, bool sticky)
+        {
+            if (target == null)
+            {
+                ClearExternalOverride();
+                return;
+            }
+            if (externalOverride && overrideTarget != null && overrideTarget != target) EndExternalOverride(OverrideLostReason.Replaced);
+            overrideTarget = target;
+            overrideTimer = FireAuthorityRules.ExternalOverrideTimer(durationS);
+            externalOverride = true;
+            externalOverrideSticky = sticky;
+            ExternalOverrideEngageable = false;
+            targetScanTimer = -100; // Scan on the next guard mode tick.
+        }
+
+        /// <summary>[Overdrive F1] Clear the external assignment (raises OnExternalOverrideLost with reason Cleared if one was live). Normal targeting resumes at the next scan.</summary>
+        public void ClearExternalOverride()
+        {
+            if (!externalOverride) return;
+            EndExternalOverride(OverrideLostReason.Cleared);
+            targetScanTimer = -100;
+        }
+
+        void EndExternalOverride(OverrideLostReason reason)
+        {
+            var lostTarget = overrideTarget;
+            externalOverride = false;
+            externalOverrideSticky = false;
+            ExternalOverrideEngageable = false;
+            overrideTarget = null;
+            overrideTimer = 0;
+            LastOverrideLostReason = reason;
+            LastOverrideLostTarget = lostTarget;
+            LastOverrideLostTime = Time.time;
+            if (BDArmorySettings.DEBUG_AI) Debug.Log($"[BDArmory.MissileFire]: {(vessel != null ? vessel.vesselName : "null")} lost its external target assignment ({reason}).");
+            if (OnExternalOverrideLost != null)
+            {
+                try { OnExternalOverrideLost(this, lostTarget, reason); }
+                catch (Exception e) { Debug.LogError($"[BDArmory.MissileFire]: OnExternalOverrideLost handler threw: {e}"); }
+            }
+        }
+
+        /// <summary>
+        /// Team assist entry point: same as the stock SetOverrideTarget(target), but doesn't overwrite a live external assignment.
+        /// </summary>
+        void SetAssistOverrideTarget(TargetInfo target)
+        {
+            if (externalOverride && overrideTarget != null)
+            {
+                ++TeamAssistOverridesBlocked;
+                return;
+            }
+            SetOverrideTarget(target);
+        }
+
+        /// <summary>[Overdrive F1/F2] Whether the target is the live external assignment or in the external secondary target snapshot.</summary>
+        public bool IsExternallyAssigned(TargetInfo target)
+        {
+            if (target == null) return false;
+            if (externalOverride && overrideTarget == target) return true;
+            return externalSecondarySet.Count > 0 && externalSecondarySet.Contains(target);
+        }
+
+        /// <summary>
+        /// [Overdrive F4] Whether target selection should skip the target because of the ExternalTargetFilter or Tight fire authority.
+        /// Always false when no filter is set and fire authority isn't Tight (stock behaviour). Missiles are never filtered.
+        /// </summary>
+        public bool IsTargetFilteredOut(TargetInfo target)
+        {
+            if (ExternalTargetFilter == null && fireAuthority != FireAuthority.Tight) return false;
+            if (target == null || target.isMissile) return false;
+            bool hasFilter = ExternalTargetFilter != null;
+            return FireAuthorityRules.ExcludedFromSelection(fireAuthority, false, IsExternallyAssigned(target), hasFilter, hasFilter && PassesExternalFilter(target));
+        }
+
+        /// <summary>
+        /// [Overdrive F3] Whether fire authority allows firing at the target. Always true with Free authority.
+        /// </summary>
+        public bool FireAuthorityPermits(TargetInfo target)
+        {
+            if (fireAuthority == FireAuthority.Free) return true;
+            if (fireAuthority == FireAuthority.Hold) return false;
+            if (target == null) return false;
+            if (target.isMissile) return true;
+            bool hasFilter = ExternalTargetFilter != null;
+            return FireAuthorityRules.PermitsFire(fireAuthority, false, IsExternallyAssigned(target), hasFilter, hasFilter && PassesExternalFilter(target));
+        }
+
+        /// <summary>
+        /// [Overdrive F3] Whether fire authority allows firing at the vessel. isProjectile: the weapon is engaging a shell or rocket (APS), which counts as self-defence.
+        /// Always true with Free authority. Allocation-free.
+        /// </summary>
+        public bool FireAuthorityPermits(Vessel targetVessel, bool isProjectile = false)
+        {
+            if (fireAuthority == FireAuthority.Free) return true;
+            if (fireAuthority == FireAuthority.Hold) return false;
+            if (isProjectile) return true;
+            if (targetVessel == null) return false;
+            if (!targetVessel.gameObject.TryGetComponent<TargetInfo>(out var targetInfo)) return false;
+            return FireAuthorityPermits(targetInfo);
+        }
+
+        bool externalFilterErrorLogged = false;
+        /// <summary>Call the ExternalTargetFilter (which must be set). An exception counts as a pass (stock behaviour) and is logged once.</summary>
+        bool PassesExternalFilter(TargetInfo target)
+        {
+            try { return ExternalTargetFilter(this, target); }
+            catch (Exception e)
+            {
+                if (!externalFilterErrorLogged) { externalFilterErrorLogged = true; Debug.LogError($"[BDArmory.MissileFire]: ExternalTargetFilter threw (treated as a pass; logged once per weapon manager): {e}"); }
+                return true;
+            }
+        }
+
+        /// <summary>Guard-initiated fire at the vessel is blocked by fire authority (only while guard mode is on).</summary>
+        bool GuardFireBlocked(Vessel targetVessel) => guardMode && fireAuthority != FireAuthority.Free && !FireAuthorityPermits(targetVessel);
+
+        /// <summary>Refresh the external secondary target snapshot (once per target scan).</summary>
+        void RefreshExternalSecondaryTargets()
+        {
+            if (ExternalSecondaryTargets == null)
+            {
+                if (externalSecondaryList.Count > 0) { externalSecondaryList.Clear(); externalSecondarySet.Clear(); }
+                return;
+            }
+            externalSecondaryList.Clear();
+            externalSecondarySet.Clear();
+            IList<TargetInfo> external = null;
+            try { external = ExternalSecondaryTargets(this); }
+            catch (Exception e) { Debug.LogError($"[BDArmory.MissileFire]: ExternalSecondaryTargets threw: {e}"); }
+            if (external == null) return;
+            for (int i = 0; i < external.Count; ++i)
+            {
+                var t = external[i];
+                if (t == null || t.Vessel == null || t.Vessel == vessel) continue;
+                if (externalSecondarySet.Add(t)) externalSecondaryList.Add(t);
+            }
+        }
+        #endregion
         public List<TargetInfo> PDMslTgts; //pointDefense/APS targets list
         public List<PooledBullet> PDBulletTgts; //pointDefense/APS targets list
         public List<PooledRocket> PDRktTgts; //pointDefense/APS targets list
@@ -4632,6 +4844,7 @@ namespace BDArmory.Control
         bool FireCurrentMissile(MissileBase missile, bool checkClearance, Vessel targetVessel = null, TargetData targetData = null)
         {
             if (missile == null) return false;
+            if (GuardFireBlocked(targetVessel != null ? targetVessel : guardTarget)) return false; // [Overdrive F3] Fire authority (while guard mode is on).
             bool DisengageAfterFiring = false;
             if (missile is MissileBase)
             {
@@ -5853,6 +6066,7 @@ namespace BDArmory.Control
         void SmartFindTarget()
         {
             bool multiTargeting = multiTargetNum > 1 || multiMissileTgtNum > 1;
+            if (ExternalSecondaryTargets != null || externalSecondaryList.Count > 0) RefreshExternalSecondaryTargets(); // [Overdrive F2] Once per scan, before selection (Tight authority uses the snapshot).
             deferSecondaryTargets = multiTargeting; // SetTarget is called for each candidate target; only find the secondary targets once the primary target is settled.
             try
             {
@@ -5885,7 +6099,7 @@ namespace BDArmory.Control
                         // Don't swap away from current target if about to enter gunrange.
                         // Only for aircraft with single-target guns: ships, subs and ground units (and vessels with multi-target turrets) fire guns and missiles at different targets simultaneously,
                         // and the long gun ranges of naval guns would otherwise pin every missile onto the first target once it reached maxMissilesOnTarget.
-                        if (currentTarget != null && !vessel.LandedOrSplashed && multiTargetNum <= 1 && (vessel.CoM + (Vector3)vessel.Velocity()).CloserToThan(currentTarget.position + currentTarget.velocity, gunRange * 0.75f))
+                        if (currentTarget != null && !(externalOverride && overrideTarget) && !vessel.LandedOrSplashed && multiTargetNum <= 1 && (vessel.CoM + (Vector3)vessel.Velocity()).CloserToThan(currentTarget.position + currentTarget.velocity, gunRange * 0.75f))
                         {
                             if (BDArmorySettings.DEBUG_MISSILES) Debug.Log("[BDArmory.MissileFire]: max targets fired on, but about to enter Gun range; keeping current target");
                             return;
@@ -5906,7 +6120,7 @@ namespace BDArmory.Control
                                             spareCams = true;
                                             break;
                                         }
-                                    if (!spareCams) return; //if current target still alive, and no extra cams, keep painting target
+                                    if (!spareCams && !(externalOverride && overrideTarget)) return; //if current target still alive, and no extra cams, keep painting target
                                 }
                             }
                             if (!(PreviousMissile.TargetingMode == MissileBase.TargetingModes.Radar && !PreviousMissile.radarLOAL))
@@ -5944,22 +6158,40 @@ namespace BDArmory.Control
                 if (missileSaturatedTargets.Count > 0) activeTargetExclusions = missileSaturatedTargets;
             }
 
+            if (externalOverride && !overrideTarget) EndExternalOverride(OverrideLostReason.TargetDestroyed); // [Overdrive F1]
             if (overrideTarget) //begin by checking the override target, since that takes priority
             {
-                targetsTried.Add(overrideTarget);
-                SetTarget(overrideTarget);
-                if (SmartPickWeapon_EngagementEnvelope(overrideTarget))
+                // [Overdrive F1] External assignments honour the ExternalTargetFilter (vessels only) and can be sticky.
+                bool filteredOut = externalOverride && ExternalTargetFilter != null && !overrideTarget.isMissile && !PassesExternalFilter(overrideTarget);
+                bool engageable = false;
+                if (!filteredOut)
                 {
-                    if (BDArmorySettings.DEBUG_AI)
-                    {
-                        Debug.Log($"[BDArmory.MissileFire]: {vessel.vesselName} is engaging an override target with {selectedWeapon}");
-                    }
-                    overrideTimer = 15f;
-                    return;
+                    targetsTried.Add(overrideTarget);
+                    SetTarget(overrideTarget);
+                    engageable = SmartPickWeapon_EngagementEnvelope(overrideTarget);
                 }
-                else if (BDArmorySettings.DEBUG_AI)
+                switch (FireAuthorityRules.EvaluateOverrideScan(externalOverride, externalOverrideSticky, filteredOut, engageable, out var overrideLostReason))
                 {
-                    Debug.Log($"[BDArmory.MissileFire]: {vessel.vesselName} is engaging an override target with failed to engage its override target!");
+                    case OverrideScanOutcome.Engage:
+                        if (BDArmorySettings.DEBUG_AI)
+                        {
+                            Debug.Log($"[BDArmory.MissileFire]: {vessel.vesselName} is engaging an override target with {selectedWeapon}");
+                        }
+                        if (externalOverride) ExternalOverrideEngageable = true; // The external assignment keeps its own duration.
+                        else overrideTimer = 15f;
+                        return;
+                    case OverrideScanOutcome.HoldNotEngageable:
+                        if (BDArmorySettings.DEBUG_AI) Debug.Log($"[BDArmory.MissileFire]: {vessel.vesselName} can't engage its sticky external target yet, keeping it as the target.");
+                        ExternalOverrideEngageable = false;
+                        if (selectedWeapon != null) { selectedWeapon = null; weaponIndex = 0; } // No weapon can engage it (the pick can bail out early without clearing the selection).
+                        return;
+                    default:
+                        if (BDArmorySettings.DEBUG_AI)
+                        {
+                            Debug.Log($"[BDArmory.MissileFire]: {vessel.vesselName} is engaging an override target with failed to engage its override target!");
+                        }
+                        if (externalOverride) EndExternalOverride(overrideLostReason);
+                        break;
                 }
             }
             overrideTarget = null; //null the override target if it cannot be used
@@ -6203,12 +6435,35 @@ namespace BDArmory.Control
             //2. highest priority non-targeted threats
             //3. closest non-targeted vessels
             int maxTargets = Mathf.Clamp(Mathf.RoundToInt(Mathf.Max(multiTargetNum, multiMissileTgtNum)), 1, (int)maxAllowableTargets);
-            if (targetMissiles && multiTargetNum > 1)
+            bool assignMissileTargets = targetMissiles && multiTargetNum > 1;
+            int maxMissileTargets = Mathf.Clamp(Mathf.RoundToInt(multiTargetNum), 1, (int)maxAllowableTargets);
+            if (externalSecondaryList.Count > 0) // [Overdrive F2] External secondary targets first, in their priority order, still capped.
             {
-                int maxMissileTargets = Mathf.Clamp(Mathf.RoundToInt(multiTargetNum), 1, (int)maxAllowableTargets);
-                BDATargetManager.GetPrioritizedMissileTargets(this, maxMissileTargets - missilesAssigned.Count, secondaryTargetSet, missilesAssigned);
+                for (int i = 0; i < externalSecondaryList.Count; ++i)
+                {
+                    var t = externalSecondaryList[i];
+                    if (t == null || t.Vessel == null || secondaryTargetSet.Contains(t) || IsTargetFilteredOut(t)) continue;
+                    if (t.isMissile)
+                    {
+                        if (!assignMissileTargets || missilesAssigned.Count >= maxMissileTargets) continue;
+                        missilesAssigned.Add(t);
+                    }
+                    else
+                    {
+                        if (targetsAssigned.Count >= maxTargets) continue;
+                        targetsAssigned.Add(t);
+                    }
+                    secondaryTargetSet.Add(t);
+                }
             }
-            BDATargetManager.GetPrioritizedVesselTargets(this, maxTargets - targetsAssigned.Count, secondaryTargetSet, targetsAssigned);
+            if (!(ExternalSecondaryTargetsOnly && ExternalSecondaryTargets != null)) // [Overdrive F2] Optionally only the external picks.
+            {
+                if (assignMissileTargets)
+                {
+                    BDATargetManager.GetPrioritizedMissileTargets(this, maxMissileTargets - missilesAssigned.Count, secondaryTargetSet, missilesAssigned);
+                }
+                BDATargetManager.GetPrioritizedVesselTargets(this, maxTargets - targetsAssigned.Count, secondaryTargetSet, targetsAssigned);
+            }
 
             // Engage the new secondary targets and disengage the ones that are no longer assigned.
             for (int i = 0; i < missilesAssigned.Count; ++i)
@@ -9202,6 +9457,7 @@ namespace BDArmory.Control
             if (target == null || missile == null) return false;
             Vessel targetVessel = target.Vessel;
             if (targetVessel == null) return false;
+            if (fireAuthority != FireAuthority.Free && !FireAuthorityPermits(target)) return false; // [Overdrive F3] Fire authority.
             WeaponClasses weaponClass = missile.GetWeaponClass();
 
             if (weaponClass == WeaponClasses.Missile && vessel.Splashed && vessel.altitude < -10)
@@ -9852,6 +10108,7 @@ namespace BDArmory.Control
         /// </summary>
         void FireParallelMissile(MissileBase missile, Vessel targetVessel, TargetData targetData)
         {
+            if (GuardFireBlocked(targetVessel)) return; // [Overdrive F3] Fire authority.
             if (missile.warheadType == MissileBase.WarheadTypes.EMP || missile.warheadType == MissileBase.WarheadTypes.Nuke)
             {
                 FireCurrentMissile(missile, false, targetVessel, targetData); // Handles withdrawing from the blast radius.
@@ -9961,7 +10218,11 @@ namespace BDArmory.Control
                     {
                         if (selectedWeapon.GetWeaponClass() == WeaponClasses.Missile || selectedWeapon.GetWeaponClass() == WeaponClasses.SLW)
                         {
-                            if (parallelFire)
+                            if (fireAuthority == FireAuthority.Hold)
+                            {
+                                // [Overdrive F3] Hold: keep the target, weapon selection and locks, but never launch.
+                            }
+                            else if (parallelFire)
                             {
                                 // Parallel salvo: fire up to parallelSalvoSize missiles at the current target and at each secondary missile target in one batch.
                                 // The batch finds its own missiles, so a null CurrentMissile (reloadable rails) is fine here.
@@ -10013,6 +10274,7 @@ namespace BDArmory.Control
                             MissileLauncher ml = selectedWeapon as MissileLauncher;
                             if (ml && vessel.altitude < ml.GetBlastRadius()) launchAuthorized = false;
                             if (launchAuthorized && firedMissiles >= maxMissilesOnTarget) launchAuthorized = false; // Don't start a bombing routine when we aren't allowed to fire any more bombs.
+                            if (launchAuthorized && GuardFireBlocked(guardTarget)) launchAuthorized = false; // [Overdrive F3] Fire authority.
                             if (launchAuthorized)
                             {
                                 // If AI controlled and the AI is extending, don't keep trying to start the bombing routine.
@@ -10044,9 +10306,15 @@ namespace BDArmory.Control
             if (overrideTimer > 0)
             {
                 overrideTimer -= TimeWarp.fixedDeltaTime;
+                if (externalOverride) // [Overdrive F1] External assignments end when their duration runs out or their target dies, and survive missile routines meanwhile.
+                {
+                    if (!overrideTarget) EndExternalOverride(OverrideLostReason.TargetDestroyed);
+                    else if (overrideTimer <= 0) EndExternalOverride(OverrideLostReason.Expired);
+                }
             }
             else
             {
+                if (externalOverride) EndExternalOverride(OverrideLostReason.Expired); // [Overdrive F1]
                 overrideTimer = 0;
                 overrideTarget = null;
             }
@@ -10281,8 +10549,8 @@ namespace BDArmory.Control
                             if (nearbyThreat == currentTarget && nearbyFriendlyWM.currentTarget != null)
                             //if being attacked by the current target, switch to the target that the nearby friendly was engaging instead
                             {
-                                SetOverrideTarget(nearbyFriendlyWM.currentTarget);
-                                nearbyFriendlyWM.SetOverrideTarget(nearbyThreat);
+                                SetAssistOverrideTarget(nearbyFriendlyWM.currentTarget); // [Overdrive F1] Team assist doesn't overwrite external assignments.
+                                nearbyFriendlyWM.SetAssistOverrideTarget(nearbyThreat);
                                 if (BDArmorySettings.DEBUG_AI)
                                     Debug.Log($"[BDArmory.MissileFire]: {vessel.vesselName} called for help from {nearbyFriendly.Vessel.vesselName} and took its target in return");
                                 //basically, swap targets to cover each other
@@ -10290,7 +10558,7 @@ namespace BDArmory.Control
                             else
                             {
                                 //otherwise, continue engaging the current target for now
-                                nearbyFriendlyWM.SetOverrideTarget(nearbyThreat);
+                                nearbyFriendlyWM.SetAssistOverrideTarget(nearbyThreat); // [Overdrive F1] Team assist doesn't overwrite external assignments.
                                 if (BDArmorySettings.DEBUG_AI)
                                     Debug.Log($"[BDArmory.MissileFire]: {vessel.vesselName} called for help from {nearbyFriendly.Vessel.vesselName}");
                             }
@@ -11163,6 +11431,7 @@ namespace BDArmory.Control
 
         public void SetOverrideTarget(TargetInfo target)
         {
+            if (externalOverride) EndExternalOverride(OverrideLostReason.Replaced); // [Overdrive F1] An explicit stock override call replaces an external assignment.
             overrideTarget = target;
             targetScanTimer = -100;
         }
