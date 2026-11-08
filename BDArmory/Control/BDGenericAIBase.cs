@@ -534,6 +534,7 @@ namespace BDArmory.Control
         {
             if (BDArmorySettings.DEBUG_AI) Debug.Log("[BDArmory.BDGenericAIBase]: Cleared waypoints");
             if (customWaypointRoute) EndCustomWaypointRoute();
+            ResetPatrolEngage(); // [Overdrive F6b]
             this.waypoints = null;
             this.activeWaypointIndex = -1;
         }
@@ -542,12 +543,15 @@ namespace BDArmory.Control
         {
             if (waypoints == null || waypoints.Count == 0)
             {
+                if (customWaypointRoute) EndCustomWaypointRoute(); // [Overdrive F6]
+                ResetPatrolEngage(); // [Overdrive F6b]
                 this.activeWaypointIndex = -1;
                 this.waypoints = null;
                 return;
             }
             if (BDArmorySettings.DEBUG_AI) Debug.Log(string.Format("[BDArmory.BDGenericAIBase]: Set {0} waypoints", waypoints.Count));
             if (customWaypointRoute) EndCustomWaypointRoute(); // [Overdrive F6] Back to the course-based waypoints.
+            ResetPatrolEngage(); // [Overdrive F6b]
             this.waypoints = waypoints;
             this.waypointCourseIndex = BDArmorySettings.WAYPOINT_COURSE_INDEX;
             this.activeWaypointIndex = 0;
@@ -591,7 +595,7 @@ namespace BDArmory.Control
         /// <param name="maxSpeeds">Optional per-point max speed (m/s) applied when heading for that point; 0 or less, or missing, means the AI's own max speed.</param>
         /// <param name="guardAtEnd">Turn guard mode on when the route completes.</param>
         /// <param name="radii">Optional per-point gate radius (m); 0 or less, or missing, means radiusM.</param>
-        /// <returns>False if the list is empty, or the AI isn't active (pilotEnabled is false) so the route didn't start.</returns>
+        /// <returns>False if the list is empty, or the AI isn't active (pilotEnabled is false); nothing is changed in that case.</returns>
         public bool SetWaypoints(List<Vector3> points, float radiusM, int laps, IList<float> maxSpeeds = null, bool guardAtEnd = false, IList<float> radii = null)
         {
             if (points == null || points.Count == 0)
@@ -599,7 +603,9 @@ namespace BDArmory.Control
                 ClearWaypoints();
                 return false;
             }
+            if (!pilotEnabled) return false; // Like the stock commands, nothing happens without an active AI; report it instead of failing silently.
             if (customWaypointRoute) EndCustomWaypointRoute();
+            ResetPatrolEngage();
             customWaypointRoute = true;
             customWaypointRadius = radiusM > 0 ? radiusM : DefaultCustomWaypointRadius;
             customWaypointRadii.Clear();
@@ -618,7 +624,7 @@ namespace BDArmory.Control
             waypointPosition = FlightGlobals.currentMainBody.GetWorldSurfacePosition(waypoint.x, waypoint.y, waypoint.z + terrainAltitude);
             ApplyCustomWaypointSpeed();
             CommandFollowWaypoints();
-            return pilotEnabled;
+            return true;
         }
 
         void EndCustomWaypointRoute()
@@ -726,6 +732,97 @@ namespace BDArmory.Control
             }
             ApplyCustomWaypointSpeed();
             UpdateCustomWaypoint(); // Recompute for the new waypoint.
+        }
+        #endregion
+
+        #region Overdrive F6b: patrol engage
+        // With waypointsYieldToCombat set, an AI whose waypoint branch comes before its attack branch (the pilot AI) breaks off its waypoints
+        // to attack the guard target, keeps its waypoint index and lap, and resumes when the target is gone or the leash breaks.
+        // The surface and VTOL AIs already engage targets before following waypoints (stock), so this only changes the pilot AI.
+
+        /// <summary>[Overdrive F6b] Break off waypoints to attack the guard target (pilot AI). False (default) is stock: waypoints come first.</summary>
+        public bool waypointsYieldToCombat = false;
+        /// <summary>[Overdrive F6b] Maximum distance in metres from the patrol anchor while engaging (0: unlimited).</summary>
+        public float patrolLeashDistance = 0f;
+        /// <summary>[Overdrive F6b] Patrol anchor as (latitude, longitude, altitude ASL). Vector3d.zero: the current waypoint.</summary>
+        public Vector3d patrolAnchor = Vector3d.zero;
+        /// <summary>[Overdrive F6b] Seconds a target whose chase broke the leash is ignored for patrol engagement.</summary>
+        public float patrolLeashCooldown = 30f;
+        /// <summary>[Overdrive F6b] Whether the AI has broken off its waypoints to engage.</summary>
+        public bool PatrolEngaged { get; private set; } = false;
+        /// <summary>[Overdrive F6b] The vessel being engaged while PatrolEngaged.</summary>
+        public Vessel PatrolTarget { get; private set; } = null;
+        /// <summary>[Overdrive F6b] Raised when an AI breaks off its waypoints to engage a target (AI, target).</summary>
+        public static event System.Action<BDGenericAIBase, Vessel> OnPatrolEngage;
+        /// <summary>[Overdrive F6b] Raised when an AI resumes its waypoints after engaging (AI, whether the leash broke the chase).</summary>
+        public static event System.Action<BDGenericAIBase, bool> OnPatrolResume;
+        Vessel patrolLeashBrokenTarget = null;
+        float patrolLeashBrokenUntil = 0f;
+
+        /// <summary>Following waypoints and not engaging (the waypoint steering behaviours apply).</summary>
+        protected bool FlyingWaypoints => IsRunningWaypoints && !PatrolEngaged;
+
+        /// <summary>
+        /// [Overdrive F6b] Whether to skip the waypoints and attack the guard target this frame. Call when waypointsYieldToCombat or PatrolEngaged is set (ends the engagement when the flag was cleared).
+        /// Hold fire authority never yields; Tight yields only for targets fire authority permits (assigned or passing the ExternalTargetFilter); Free yields for any target.
+        /// </summary>
+        protected bool PatrolShouldEngage()
+        {
+            var weaponManager = WeaponManager;
+            var target = targetVessel;
+            bool engage = waypointsYieldToCombat && IsRunningWaypoints && weaponManager != null && weaponManager.guardMode && target != null && !BDArmorySettings.PEACE_MODE
+                && weaponManager.fireAuthority != FireAuthority.Hold
+                && (weaponManager.fireAuthority == FireAuthority.Free || weaponManager.FireAuthorityPermits(target));
+            if (engage && target == patrolLeashBrokenTarget && Time.time < patrolLeashBrokenUntil) engage = false;
+            bool leashBroken = false;
+            if (engage && patrolLeashDistance > 0)
+            {
+                var anchor = patrolAnchor == Vector3d.zero ? waypointPosition : (Vector3)FlightGlobals.currentMainBody.GetWorldSurfacePosition(patrolAnchor.x, patrolAnchor.y, patrolAnchor.z);
+                if ((vessel.CoM - anchor).sqrMagnitude > patrolLeashDistance * patrolLeashDistance)
+                {
+                    engage = false;
+                    leashBroken = true;
+                    patrolLeashBrokenTarget = target;
+                    patrolLeashBrokenUntil = Time.time + patrolLeashCooldown;
+                    if (weaponManager.ExternalOverrideTarget != null && weaponManager.ExternalOverrideTarget.Vessel == target) weaponManager.ClearExternalOverride(); // Don't get pulled straight back.
+                    if (BDArmorySettings.DEBUG_AI) Debug.Log($"[BDArmory.BDGenericAIBase]: {vessel.vesselName} broke off the chase of {target.vesselName}: beyond the {patrolLeashDistance:0}m patrol leash.");
+                }
+            }
+            if (engage)
+            {
+                if (!PatrolEngaged || PatrolTarget != target)
+                {
+                    PatrolEngaged = true;
+                    PatrolTarget = target;
+                    if (BDArmorySettings.DEBUG_AI) Debug.Log($"[BDArmory.BDGenericAIBase]: {vessel.vesselName} breaking off its waypoints to engage {target.vesselName}.");
+                    if (OnPatrolEngage != null)
+                    {
+                        try { OnPatrolEngage(this, target); }
+                        catch (System.Exception e) { Debug.LogError($"[BDArmory.BDGenericAIBase]: OnPatrolEngage handler threw: {e}"); }
+                    }
+                }
+                return true;
+            }
+            if (PatrolEngaged) EndPatrolEngage(leashBroken);
+            return false;
+        }
+
+        void EndPatrolEngage(bool leashBroken)
+        {
+            PatrolEngaged = false;
+            PatrolTarget = null;
+            if (BDArmorySettings.DEBUG_AI) Debug.Log($"[BDArmory.BDGenericAIBase]: {vessel.vesselName} resuming its waypoints{(leashBroken ? " (leash)" : "")}.");
+            if (OnPatrolResume != null)
+            {
+                try { OnPatrolResume(this, leashBroken); }
+                catch (System.Exception e) { Debug.LogError($"[BDArmory.BDGenericAIBase]: OnPatrolResume handler threw: {e}"); }
+            }
+        }
+
+        /// <summary>End a patrol engagement when the waypoints stop (cleared, completed or replaced).</summary>
+        protected void ResetPatrolEngage()
+        {
+            if (PatrolEngaged) EndPatrolEngage(false);
         }
         #endregion
 

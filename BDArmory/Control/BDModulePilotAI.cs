@@ -2152,7 +2152,7 @@ namespace BDArmory.Control
 
             UpdateVelocityRelativeDirections();
             CheckLandingGear();
-            if (IsRunningWaypoints) UpdateWaypoint(); // Update the waypoint state.
+            if (IsRunningWaypoints && !PatrolEngaged) UpdateWaypoint(); // Update the waypoint state. ([Overdrive F6b] Frozen while engaging so the patrol resumes at the same waypoint.)
 
             wasGainingAlt = gainingAlt; gainingAlt = false;
             if (!vessel.LandedOrSplashed && ((!(ramming && steerMode == SteerModes.Manoeuvering) && FlyAvoidTerrain(s)) || (!ramming && FlyAvoidOthers(s)))) // Avoid terrain and other planes, unless we're trying to ram stuff.
@@ -2285,7 +2285,7 @@ namespace BDArmory.Control
                 turningTimer = 0;
                 return;
             }
-            else if (!extending && IsRunningWaypoints)
+            else if (!extending && IsRunningWaypoints && !((waypointsYieldToCombat || PatrolEngaged) && PatrolShouldEngage())) // [Overdrive F6b] Optionally break off the waypoints to attack.
             {
                 // FIXME To avoid getting stuck circling a waypoint, a check should be made (maybe use the turningTimer for this?), in which case the plane should RequestExtend away from the waypoint.
                 FlyWaypoints(s);
@@ -2929,7 +2929,7 @@ namespace BDArmory.Control
                 weaponManager && ((
                         steerMode == SteerModes.NormalFlight
                         || steerMode == SteerModes.Aiming && weaponManager.CurrentMissile != null && !isBombing
-                        || IsRunningWaypoints
+                        || FlyingWaypoints
                     ) && weaponManager.guardMode && // Also, if we know enemies are near, but they're beyond gun or visual range and we're not aiming a gun, or we're running a WP course and standard evasion isn't ideal
                     BDATargetManager.TargetList(weaponManager.Team).Where(target =>
                         !target.isMissile &&
@@ -2979,7 +2979,7 @@ namespace BDArmory.Control
                 localTargetDirection = velocityTransform.InverseTransformDirection(targetPosition - velocityTransform.position).normalized;
                 localTargetDirection = Vector3.RotateTowards(Vector3.up, localTargetDirection, 45 * Mathf.Deg2Rad, 0);
 
-                if (useWaypointYawAuthority && IsRunningWaypoints)
+                if (useWaypointYawAuthority && FlyingWaypoints)
                 {
                     var refYawDir = Vector3.RotateTowards(Vector3.up, vesselTransform.InverseTransformDirection(targetDirection), 25 * Mathf.Deg2Rad, 0).normalized;
                     var velYawDir = Vector3.RotateTowards(Vector3.up, vesselTransform.InverseTransformDirection(vessel.Velocity()), 45 * Mathf.Deg2Rad, 0).normalized;
@@ -3094,7 +3094,7 @@ namespace BDArmory.Control
             {
                 rollTarget = (targetPosition - vesselPos + rollUp * Mathf.Clamp((targetPosition - vesselPos).magnitude / 500f, 0f, 1f) * upDirection).ProjectOnPlanePreNormalized(vesselUp);
             }
-            else if (useWaypointRollTarget && IsRunningWaypoints)
+            else if (useWaypointRollTarget && FlyingWaypoints)
             {
                 var angle = waypointRollTargetStrength * VectorUtils.Angle(waypointRollTarget, rollTarget);
                 rollTarget = Vector3.RotateTowards(rollTarget, waypointRollTarget, angle * Mathf.Deg2Rad, 0f).ProjectOnPlane(vessel.Velocity());
@@ -3890,7 +3890,7 @@ namespace BDArmory.Control
 
                 //for the most part, we want to turn _towards_ the threat in order to increase the rel ang vel and get under its guns
                 //for Waypoint Race evasion, keep pointing towards next gate; dodging is handled by evasion non-linearity waggle in FlyToPosition
-                Vector3 breakTarget = (IsRunningWaypoints ? (waypointPosition - vessel.transform.position) : threatRelativePosition) * 2f;
+                Vector3 breakTarget = (FlyingWaypoints ? (waypointPosition - vessel.transform.position) : threatRelativePosition) * 2f;
 
                 if (weaponManager.incomingThreatVessel != null && weaponManager.incomingThreatVessel.LandedOrSplashed) // Surface threat.
                 {
