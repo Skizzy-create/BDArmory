@@ -514,6 +514,7 @@ namespace BDArmory.UI
 
             ModuleManagerLoaded = ModuleManager.CheckForModuleManager();
             PhysicsRangeExtenderLoaded = PhysicsRangeExtender.CheckForPhysicsRangeExtender();
+            if (PhysicsRangeExtenderLoaded) PhysicsRangeExtender.RemoveLeakedCallbacks(); // The previous scene's PRE instances have been destroyed by now.
 
             if (HighLogic.LoadedSceneIsFlight)
             {

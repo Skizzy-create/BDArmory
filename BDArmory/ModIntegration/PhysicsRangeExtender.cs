@@ -58,5 +58,53 @@ namespace BDArmory.ModIntegration
 			}
 			return true;
 		}
+
+		/// <summary>
+		/// Work around PhysicsRangeExtender (1.21.0, the latest release) leaking GameEvents callbacks, and with them its destroyed addon instances, on every flight scene:
+		/// its OnDestroy adds onVesselSituationChange again instead of removing it (jrodrigv/PhysicsRangeExtender issue #24) and its GUI never removes onShowUI/onHideUI.
+		/// The leaked handlers keep running on the dead instances. KSPCommunityFixes only reports these (they belong to a mod's KSPAddon), so remove them here.
+		/// Call after the previous scene has been destroyed (e.g., from a Start method).
+		/// </summary>
+		/// <returns>The number of callbacks removed.</returns>
+		public static int RemoveLeakedCallbacks()
+		{
+			if (!havePRE) return 0;
+			int removed = 0;
+			try
+			{
+				removed += RemoveDestroyedPRECallbacks(GameEvents.onVesselSituationChange);
+				removed += RemoveDestroyedPRECallbacks(GameEvents.onShowUI);
+				removed += RemoveDestroyedPRECallbacks(GameEvents.onHideUI);
+			}
+			catch (Exception e)
+			{
+				Debug.LogWarning($"[BDArmory.PhysicsRangeExtender]: Failed to remove leaked PhysicsRangeExtender callbacks: {e.Message}");
+			}
+			if (removed > 0) Debug.Log($"[BDArmory.PhysicsRangeExtender]: Removed {removed} GameEvents callbacks owned by destroyed PhysicsRangeExtender instances.");
+			return removed;
+		}
+
+		static int RemoveDestroyedPRECallbacks(BaseGameEvent gameEvent)
+		{
+			if (gameEvent == null) return 0;
+			// EventData<T> and EventVoid both keep their subscribers in a private "events" list of EvtDelegate objects with a public "evt" delegate field.
+			var eventsField = gameEvent.GetType().GetField("events", BindingFlags.NonPublic | BindingFlags.Instance);
+			if (eventsField == null || eventsField.GetValue(gameEvent) is not System.Collections.IList events) return 0;
+			int removed = 0;
+			for (int i = events.Count - 1; i >= 0; --i)
+			{
+				var evtDelegate = events[i];
+				if (evtDelegate == null) continue;
+				var evtField = evtDelegate.GetType().GetField("evt", BindingFlags.Public | BindingFlags.Instance);
+				if (evtField == null || evtField.GetValue(evtDelegate) is not Delegate callback) continue;
+				if (callback.Target is UnityEngine.Object owner && owner == null // Unity null check: the owner has been destroyed.
+					&& owner.GetType().Assembly.GetName().Name == "PhysicsRangeExtender")
+				{
+					events.RemoveAt(i);
+					++removed;
+				}
+			}
+			return removed;
+		}
 	}
 }
