@@ -324,9 +324,11 @@ namespace OverdriveTests
         [Test]
         public static void Plan_IslandBeyondSearchRadiusIsNoClearSpace()
         {
-            Func<SpawnOffset, bool> free = p => (p - new SpawnOffset(0, 2000)).Length <= 300;
-            var plan = MultiSpawnLayout.Plan(3, Abreast, 20, 30, 3, 10, free); // default 8 rings, ~506 m reach
+            // Small block: 8 diagonals would only reach ~506 m, the minimum reach makes it 2 km; an island 6 km away is out of reach (max 5 km).
+            Func<SpawnOffset, bool> free = p => (p - new SpawnOffset(0, 6000)).Length <= 300;
+            var plan = MultiSpawnLayout.Plan(3, Abreast, 20, 30, 3, 10, free);
             Assert.Equal(MultiSpawnStatus.NoClearSpace, plan.status);
+            Assert.Near(MultiSpawnLayout.DefaultMinSearchReach, plan.searchReach, 1e-9, "searchReach");
         }
 
         [Test]

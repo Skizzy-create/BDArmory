@@ -19,12 +19,14 @@ namespace BDArmory.VesselSpawning
         Placed,
         /// <summary>Some slots were shifted outward along the line to find clear space.</summary>
         Shifted,
-        /// <summary>The whole block was moved to a different centre (see MultiSpawnPlan.centre).</summary>
+        /// <summary>The whole block was moved to a different centre (see MultiSpawnPlan.centre). MultiSpawnPlan.wrapped tells whether its rows also wrapped early.</summary>
         Moved,
-        /// <summary>No clear space was found within the search radius (see MultiSpawnPlan.bestCentre).</summary>
+        /// <summary>No clear space was found within the search radius (see MultiSpawnPlan.bestCentre and checkBudgetExhausted).</summary>
         NoClearSpace,
         /// <summary>The count was zero or negative.</summary>
         InvalidCount,
+        /// <summary>At the requested point, clear space along a line ran out, so the remaining slots wrapped into the next row (more or shorter rows than requested).</summary>
+        Wrapped,
     }
 
     /// <summary>
@@ -47,11 +49,12 @@ namespace BDArmory.VesselSpawning
     public sealed class MultiSpawnPlan
     {
         public MultiSpawnStatus status;
-        /// <summary>Final slot positions relative to the requested point, in layout order (slot 0 is the leader). Empty unless the status is Placed, Shifted or Moved.</summary>
+        /// <summary>Final slot positions relative to the requested point, in layout order (slot 0 is the leader). Empty unless the status is Placed, Shifted, Wrapped or Moved.</summary>
         public readonly List<SpawnOffset> slots = [];
         /// <summary>Row of each slot in `slots`.</summary>
         public readonly List<int> slotRows = [];
         public int perRow;
+        /// <summary>Rows of the layout (the rows actually used when `wrapped`).</summary>
         public int rows;
         /// <summary>Number of slots shifted outward along the line.</summary>
         public int shiftedSlots;
@@ -60,8 +63,14 @@ namespace BDArmory.VesselSpawning
         /// <summary>When NoClearSpace: the candidate centre with the most free slots, and how many.</summary>
         public SpawnOffset bestCentre;
         public int bestFreeSlots;
-        /// <summary>Number of clear-space checks made (for diagnostics).</summary>
+        /// <summary>Number of clear-space checks made (calls of isFree; a position that was already checked is answered from a cache).</summary>
         public int checks;
+        /// <summary>The rows wrapped early because clear space along a line ran out (status Wrapped, or Moved with wrapped rows).</summary>
+        public bool wrapped;
+        /// <summary>How far from the requested point candidate centres were searched (m).</summary>
+        public double searchReach;
+        /// <summary>The search stopped because the clear-space check budget ran out (only with NoClearSpace).</summary>
+        public bool checkBudgetExhausted;
         public double MovedBy => centre.Length;
     }
 
@@ -76,6 +85,16 @@ namespace BDArmory.VesselSpawning
         public const int MaxShiftSteps = 3;
         public const int DefaultMaxRings = 8;
         public const double DefaultMaxSearchRadius = 5000;
+        /// <summary>The ring search reaches at least this far (m), even for a small block whose 8 × diagonal would only reach a few hundred metres.</summary>
+        public const double DefaultMinSearchReach = 2000;
+        /// <summary>Most rings used to cover the minimum reach (the step between rings grows instead).</summary>
+        public const int MaxRingsForMinReach = 16;
+        /// <summary>
+        /// Clear-space check budget of a plan: at least this many checks, or CheckBudgetPerSlot per slot, whichever is more.
+        /// Enough for the default search over a fully blocked area; most failing checks in-game are cheap (one or two terrain queries).
+        /// </summary>
+        public const int MinCheckBudget = 20000;
+        public const int CheckBudgetPerSlot = 50;
         public const int DefaultMaxPartsPerFrame = 400;
         public const int DefaultMinFramesBetweenSpawns = 2;
         public const double DefaultPartsPerPhysicsMs = 250; // Rough default: 1 ms of physics per 250 parts.
@@ -109,6 +128,33 @@ namespace BDArmory.VesselSpawning
         }
 
         public static int Rows(int count, int perRow) => count <= 0 || perRow <= 0 ? 0 : (count + perRow - 1) / perRow;
+
+        /// <summary>Most rows a wrapped layout may use: twice the rows of the requested layout, and at least 3 more, so the block stays compact.</summary>
+        public static int MaxWrappedRows(int count, int perRow)
+        {
+            int rows = Rows(count, perRow <= 0 ? count : perRow);
+            return Math.Max(2 * rows, rows + 3);
+        }
+
+        /// <summary>The clear-space check budget of a plan for count slots.</summary>
+        public static int DefaultCheckBudget(int count) => (int)Math.Min(int.MaxValue, Math.Max(MinCheckBudget, (long)CheckBudgetPerSlot * Math.Max(0, count)));
+
+        /// <summary>
+        /// Ring search geometry. The reach is maxRings × the natural step (the block diagonal, so it scales with craft size and count), but at least minSearchReach
+        /// and at most maxSearchRadius. The rings are a natural step apart, except that covering the minimum reach uses at most max(maxRings, MaxRingsForMinReach)
+        /// rings (the step grows instead). Returns the number of rings (0: no ring search).
+        /// </summary>
+        public static int SearchRings(double naturalStep, int maxRings, double minSearchReach, double maxSearchRadius, out double step, out double reach)
+        {
+            naturalStep = Math.Max(1, naturalStep);
+            reach = Math.Min(Math.Max(0, maxSearchRadius), Math.Max(Math.Max(0, maxRings) * naturalStep, Math.Max(0, minSearchReach)));
+            step = naturalStep;
+            if (reach <= 0) { reach = 0; return 0; }
+            int rings = (int)Math.Ceiling(reach / naturalStep - 1e-9);
+            rings = Math.Max(1, Math.Min(rings, Math.Max(maxRings, MaxRingsForMinReach)));
+            step = reach / rings;
+            return rings;
+        }
 
         /// <summary>
         /// The layout before clear-space checks, relative to the requested point.
@@ -156,9 +202,12 @@ namespace BDArmory.VesselSpawning
         }
 
         /// <summary>
-        /// Plan the slots: lay them out, check each for clear space, shift blocked slots outward along the line (by spacing/2, up to 3 times, keeping the order),
-        /// and if any slot is still blocked move the whole block, searching candidate centres in rings around the point
-        /// (step = block diagonal, up to maxRings rings and maxSearchRadius) and taking the nearest centre where every slot is free.
+        /// Plan the slots (06-flight-control.md §9.1):
+        /// 1. lay them out at the requested point, check each for clear space, and shift blocked slots outward along the line (by spacing/2, up to 3 times, keeping the order);
+        /// 2. if a slot is still blocked, lay the rows out again so that a line wraps into the next row where its clear space ends (as well as at perRow and maxRowLength);
+        /// 3. if that fails too, move the whole block: candidate centres in rings around the point, nearest first (reach and step from SearchRings), first with the
+        ///    requested layout and then with wrapping rows, taking the first centre where every slot is free.
+        /// The search stops at maxChecks clear-space checks (0: DefaultCheckBudget(count)), so a blocked area can't stall the game.
         /// </summary>
         /// <param name="count">Number of vessels (any positive number).</param>
         /// <param name="direction">Abreast or trail.</param>
@@ -167,7 +216,13 @@ namespace BDArmory.VesselSpawning
         /// <param name="perRow">Slots per row (from PerRow).</param>
         /// <param name="minSeparation">Minimum distance between accepted slots (m), normally the craft's size along the line.</param>
         /// <param name="isFree">Clear-space check for a slot at an offset from the requested point. Called many times; must not be null.</param>
-        public static MultiSpawnPlan Plan(int count, MultiSpawnLineDirection direction, double spacing, double rowSpacing, int perRow, double minSeparation, Func<SpawnOffset, bool> isFree, int maxRings = DefaultMaxRings, double maxSearchRadius = DefaultMaxSearchRadius)
+        /// <param name="maxRings">Rings of the move search at the natural step (the block diagonal).</param>
+        /// <param name="maxSearchRadius">Largest move (m).</param>
+        /// <param name="minSearchReach">The move search reaches at least this far (m), within maxSearchRadius.</param>
+        /// <param name="maxRowLength">Longest row (m) when rows wrap (step 2); 0 or less: unlimited.</param>
+        /// <param name="maxChecks">Budget of isFree calls; 0 or less: DefaultCheckBudget(count).</param>
+        public static MultiSpawnPlan Plan(int count, MultiSpawnLineDirection direction, double spacing, double rowSpacing, int perRow, double minSeparation, Func<SpawnOffset, bool> isFree,
+            int maxRings = DefaultMaxRings, double maxSearchRadius = DefaultMaxSearchRadius, double minSearchReach = DefaultMinSearchReach, double maxRowLength = DefaultMaxRowLength, int maxChecks = 0)
         {
             if (isFree == null) throw new ArgumentNullException(nameof(isFree));
             var plan = new MultiSpawnPlan();
@@ -179,9 +234,22 @@ namespace BDArmory.VesselSpawning
             if (perRow <= 0) perRow = count;
             plan.perRow = perRow;
             plan.rows = Rows(count, perRow);
+            var checker = new ClearSpaceChecker(isFree, maxChecks > 0 ? maxChecks : DefaultCheckBudget(count));
+            double minSepSqr = Math.Max(0, minSeparation) * Math.Max(0, minSeparation);
             var layout = new List<SpawnOffset>(count);
             var rowsOfSlots = new List<int>(count);
             ComputeSlots(count, direction, spacing, rowSpacing, perRow, layout, rowsOfSlots);
+
+            // Move search geometry: the natural step is the block diagonal.
+            double minR = 0, maxR = 0, minF = 0, maxF = 0;
+            for (int i = 0; i < count; ++i)
+            {
+                minR = Math.Min(minR, layout[i].right); maxR = Math.Max(maxR, layout[i].right);
+                minF = Math.Min(minF, layout[i].forward); maxF = Math.Max(maxF, layout[i].forward);
+            }
+            double width = maxR - minR + spacing, depth = maxF - minF + spacing;
+            int rings = SearchRings(Math.Max(Math.Sqrt(width * width + depth * depth), Math.Max(spacing, 1)), maxRings, minSearchReach, maxSearchRadius, out double step, out double reach);
+            plan.searchReach = reach;
 
             // Process slots from the centre of each line outward, so that shifting a slot outward only moves it towards slots that haven't been placed yet.
             var order = new int[count];
@@ -198,51 +266,76 @@ namespace BDArmory.VesselSpawning
             });
 
             var placed = new SpawnOffset[count];
+            var wrappedSlots = new List<SpawnOffset>(count);
+            var wrappedRows = new List<int>(count);
+            var origin = new SpawnOffset(0, 0);
+            plan.bestCentre = origin;
+
             // 1. In place, with shifting.
-            if (TryPlace(direction, layout, order, new SpawnOffset(0, 0), spacing, minSeparation, isFree, true, placed, out int shifted, out int free, ref plan.checks))
+            if (TryPlace(direction, layout, order, origin, spacing, minSepSqr, checker, placed, out int shifted, out int free))
             {
                 Fill(plan, placed, rowsOfSlots);
                 plan.shiftedSlots = shifted;
                 plan.status = shifted > 0 ? MultiSpawnStatus.Shifted : MultiSpawnStatus.Placed;
-                return plan;
+                return Finish(plan, checker);
             }
             plan.bestFreeSlots = free;
-            plan.bestCentre = new SpawnOffset(0, 0);
 
-            // 2. Move the whole block: rings of candidate centres around the point.
-            double minR = 0, maxR = 0, minF = 0, maxF = 0;
-            for (int i = 0; i < count; ++i)
+            // 2. In place, wrapping rows where clear space along a line ends.
+            if (TryPlaceWrapped(count, direction, origin, spacing, rowSpacing, perRow, minSepSqr, maxRowLength, checker, wrappedSlots, wrappedRows, out shifted, out int rowsUsed))
             {
-                minR = Math.Min(minR, layout[i].right); maxR = Math.Max(maxR, layout[i].right);
-                minF = Math.Min(minF, layout[i].forward); maxF = Math.Max(maxF, layout[i].forward);
+                FillWrapped(plan, wrappedSlots, wrappedRows, rowsUsed, shifted);
+                plan.status = MultiSpawnStatus.Wrapped;
+                return Finish(plan, checker);
             }
-            double width = maxR - minR + spacing, depth = maxF - minF + spacing;
-            double step = Math.Max(Math.Sqrt(width * width + depth * depth), Math.Max(spacing, 1));
-            for (int ring = 1; ring <= maxRings; ++ring)
+            if (wrappedSlots.Count > plan.bestFreeSlots) plan.bestFreeSlots = wrappedSlots.Count;
+
+            // 3. Move the whole block: rings of candidate centres around the point, first with the requested layout, then with wrapping rows.
+            for (int pass = 0; pass < 2 && !checker.exhausted; ++pass)
             {
-                double radius = ring * step;
-                if (radius > maxSearchRadius) break;
-                int candidates = Math.Max(8, 8 * ring);
-                for (int k = 0; k < candidates; ++k)
+                for (int ring = 1; ring <= rings && !checker.exhausted; ++ring)
                 {
-                    double angle = 2 * Math.PI * k / candidates;
-                    var centre = new SpawnOffset(radius * Math.Sin(angle), radius * Math.Cos(angle));
-                    if (TryPlace(direction, layout, order, centre, spacing, minSeparation, isFree, true, placed, out shifted, out free, ref plan.checks))
+                    double radius = ring * step;
+                    int candidates = Math.Max(8, 8 * ring);
+                    for (int k = 0; k < candidates && !checker.exhausted; ++k)
                     {
-                        Fill(plan, placed, rowsOfSlots);
-                        plan.shiftedSlots = shifted;
-                        plan.centre = centre;
-                        plan.status = MultiSpawnStatus.Moved;
-                        return plan;
-                    }
-                    if (free > plan.bestFreeSlots)
-                    {
-                        plan.bestFreeSlots = free;
-                        plan.bestCentre = centre;
+                        double angle = 2 * Math.PI * k / candidates;
+                        var centre = new SpawnOffset(radius * Math.Sin(angle), radius * Math.Cos(angle));
+                        bool ok;
+                        if (pass == 0)
+                        {
+                            ok = TryPlace(direction, layout, order, centre, spacing, minSepSqr, checker, placed, out shifted, out free);
+                            if (ok) Fill(plan, placed, rowsOfSlots);
+                        }
+                        else
+                        {
+                            ok = TryPlaceWrapped(count, direction, centre, spacing, rowSpacing, perRow, minSepSqr, maxRowLength, checker, wrappedSlots, wrappedRows, out shifted, out rowsUsed);
+                            free = wrappedSlots.Count;
+                            if (ok) FillWrapped(plan, wrappedSlots, wrappedRows, rowsUsed, shifted);
+                        }
+                        if (ok)
+                        {
+                            plan.shiftedSlots = shifted;
+                            plan.centre = centre;
+                            plan.status = MultiSpawnStatus.Moved;
+                            return Finish(plan, checker);
+                        }
+                        if (free > plan.bestFreeSlots)
+                        {
+                            plan.bestFreeSlots = free;
+                            plan.bestCentre = centre;
+                        }
                     }
                 }
             }
             plan.status = MultiSpawnStatus.NoClearSpace;
+            plan.checkBudgetExhausted = checker.exhausted;
+            return Finish(plan, checker);
+        }
+
+        static MultiSpawnPlan Finish(MultiSpawnPlan plan, ClearSpaceChecker checker)
+        {
+            plan.checks = checker.checks;
             return plan;
         }
 
@@ -254,24 +347,55 @@ namespace BDArmory.VesselSpawning
             plan.slotRows.AddRange(rowsOfSlots);
         }
 
-        static bool TryPlace(MultiSpawnLineDirection direction, List<SpawnOffset> layout, int[] order, SpawnOffset centre, double spacing, double minSeparation, Func<SpawnOffset, bool> isFree, bool allowShift, SpawnOffset[] placed, out int shifted, out int free, ref int checks)
+        static void FillWrapped(MultiSpawnPlan plan, List<SpawnOffset> slots, List<int> rows, int rowsUsed, int shifted)
+        {
+            plan.slots.Clear();
+            plan.slotRows.Clear();
+            plan.slots.AddRange(slots);
+            plan.slotRows.AddRange(rows);
+            plan.rows = rowsUsed;
+            plan.wrapped = true;
+            plan.shiftedSlots = shifted;
+        }
+
+        /// <summary>
+        /// isFree with a budget and a cache: a position checked before (to the centimetre) is answered from the cache and doesn't count as a check.
+        /// </summary>
+        sealed class ClearSpaceChecker(Func<SpawnOffset, bool> isFree, int budget)
+        {
+            readonly Dictionary<long, bool> cache = [];
+            public int checks;
+            public bool exhausted;
+
+            /// <summary>False when the budget has run out and the position isn't cached (it wasn't checked).</summary>
+            public bool TryCheck(SpawnOffset position, out bool free)
+            {
+                long key = ((long)Math.Round(position.right * 100) << 32) ^ ((long)Math.Round(position.forward * 100) & 0xFFFFFFFFL);
+                if (cache.TryGetValue(key, out free)) return true;
+                if (checks >= budget) { exhausted = true; return false; }
+                ++checks;
+                free = isFree(position);
+                cache[key] = free;
+                return true;
+            }
+        }
+
+        static bool TryPlace(MultiSpawnLineDirection direction, List<SpawnOffset> layout, int[] order, SpawnOffset centre, double spacing, double minSepSqr, ClearSpaceChecker checker, SpawnOffset[] placed, out int shifted, out int free)
         {
             shifted = 0;
             free = 0;
-            double minSepSqr = Math.Max(0, minSeparation) * Math.Max(0, minSeparation);
             for (int n = 0; n < order.Length; ++n)
             {
                 int i = order[n];
                 var basePos = centre + layout[i];
                 var outward = OutwardDirection(direction, layout[i]);
                 bool ok = false;
-                int maxSteps = allowShift ? MaxShiftSteps : 0;
-                for (int s = 0; s <= maxSteps; ++s)
+                for (int s = 0; s <= MaxShiftSteps; ++s)
                 {
                     var candidate = basePos + outward * (s * spacing * 0.5);
                     if (!ClearOfPlaced(candidate, placed, order, n, minSepSqr)) continue;
-                    ++checks;
-                    if (!isFree(candidate)) continue;
+                    if (!checker.TryCheck(candidate, out bool isFree)) return false; // Out of budget.
+                    if (!isFree) continue;
                     placed[i] = candidate;
                     if (s > 0) ++shifted;
                     ok = true;
@@ -283,12 +407,81 @@ namespace BDArmory.VesselSpawning
             return true;
         }
 
+        /// <summary>
+        /// Lay the slots out row by row, wrapping into the next row when a row holds perRow slots, reaches maxRowLength, or its clear space ends.
+        /// Abreast: rows stack behind the point (0, -rowSpacing, ...); each line is filled from its centre outward on both sides, alternately, and a side ends at the
+        /// first position that is still blocked after shifting (clear space along the line ended). Trail: rows sit side by side at 0, +1, -1, +2, ... row spacings;
+        /// each line runs backward from the row's head. Fails if a row gets no slot at all (no compact block here) or more than MaxWrappedRows rows are needed.
+        /// Slots are returned in placement order (slot 0 is the leader at the centre of the first row).
+        /// </summary>
+        static bool TryPlaceWrapped(int count, MultiSpawnLineDirection direction, SpawnOffset centre, double spacing, double rowSpacing, int perRow, double minSepSqr, double maxRowLength,
+            ClearSpaceChecker checker, List<SpawnOffset> placed, List<int> placedRows, out int shifted, out int rowsUsed)
+        {
+            placed.Clear();
+            placedRows.Clear();
+            shifted = 0;
+            rowsUsed = 0;
+            bool abreast = direction == MultiSpawnLineDirection.Abreast;
+            int maxRows = MaxWrappedRows(count, perRow);
+            double limit = maxRowLength > 0 ? (abreast ? 0.5 * maxRowLength : maxRowLength) : double.PositiveInfinity; // |along| ≤ limit
+            for (int row = 0; row < maxRows && placed.Count < count; ++row)
+            {
+                double rowCoord = abreast ? -row * rowSpacing : ((row + 1) / 2) * (row % 2 == 1 ? 1 : -1) * rowSpacing;
+                double nextPos = 0, nextNeg = -spacing; // Along-line coordinate of the next slot on each side (trail: measured backward, one side only).
+                bool posOpen = true, negOpen = abreast;
+                int posCount = 0, negCount = 0, inRow = 0;
+                while (inRow < perRow && placed.Count < count && (posOpen || negOpen))
+                {
+                    bool pos = posOpen && (!negOpen || posCount <= negCount);
+                    double basePos = pos ? nextPos : nextNeg;
+                    double dir = pos ? 1 : -1;
+                    bool found = false;
+                    for (int s = 0; s <= MaxShiftSteps; ++s)
+                    {
+                        double alongLine = basePos + dir * s * spacing * 0.5;
+                        if (Math.Abs(alongLine) > limit + 1e-6) break; // Past the end of the row.
+                        var candidate = centre + (abreast ? new SpawnOffset(alongLine, rowCoord) : new SpawnOffset(rowCoord, -alongLine));
+                        if (!ClearOf(candidate, placed, minSepSqr)) continue;
+                        if (!checker.TryCheck(candidate, out bool isFree)) return false; // Out of budget.
+                        if (!isFree) continue;
+                        placed.Add(candidate);
+                        placedRows.Add(row);
+                        if (s > 0) ++shifted;
+                        if (pos) { nextPos = alongLine + spacing; ++posCount; }
+                        else { nextNeg = alongLine - spacing; ++negCount; }
+                        ++inRow;
+                        found = true;
+                        break;
+                    }
+                    if (!found) // Clear space along this side of the line ended.
+                    {
+                        if (pos) posOpen = false;
+                        else negOpen = false;
+                    }
+                }
+                if (inRow == 0) return false;
+                rowsUsed = row + 1;
+            }
+            return placed.Count == count;
+        }
+
         static bool ClearOfPlaced(SpawnOffset candidate, SpawnOffset[] placed, int[] order, int placedCount, double minSepSqr)
         {
             if (minSepSqr <= 0) return true;
             for (int m = 0; m < placedCount; ++m)
             {
                 var d = candidate - placed[order[m]];
+                if (d.right * d.right + d.forward * d.forward < minSepSqr - 1e-9) return false;
+            }
+            return true;
+        }
+
+        static bool ClearOf(SpawnOffset candidate, List<SpawnOffset> placed, double minSepSqr)
+        {
+            if (minSepSqr <= 0) return true;
+            for (int m = 0; m < placed.Count; ++m)
+            {
+                var d = candidate - placed[m];
                 if (d.right * d.right + d.forward * d.forward < minSepSqr - 1e-9) return false;
             }
             return true;
