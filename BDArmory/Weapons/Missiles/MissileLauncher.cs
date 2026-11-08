@@ -2192,10 +2192,8 @@ namespace BDArmory.Weapons.Missiles
 
         void OnDisable()
         {
-            if (TargetingMode == TargetingModes.AntiRad)
-            {
-                RadarWarningReceiver.OnRadarPing -= ReceiveRadarPing;
-            }
+            // Unsubscribe regardless of the current mode: anti-radiation missiles that switched to a terminal seeker were never removed from this static event, which kept them (and their vessel) alive for the rest of the session.
+            RadarWarningReceiver.OnRadarPing -= ReceiveRadarPing;
         }
 
         void Update()

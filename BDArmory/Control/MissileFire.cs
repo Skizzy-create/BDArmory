@@ -10322,7 +10322,8 @@ namespace BDArmory.Control
             if (selectedWeapon == null) return;
             int TurretID = 0;
             int MissileTgtID = 0;
-            HashSet<TargetInfo> firedTargets = [];
+            var firedTargets = guardFiredTargets; // Reused set (this method doesn't yield or recurse); cleared at the end so it doesn't hold targets.
+            firedTargets.Clear();
             bool multiTargetDistributed = false;
             using (var weapon = VesselModuleRegistry.GetModules<ModuleWeapon>(vessel).GetEnumerator())
                 while (weapon.MoveNext())
@@ -10459,7 +10460,9 @@ namespace BDArmory.Control
                     if (t != null && t != currentTarget && !firedTargets.Contains(t)) t.Disengage(this);
                 }
             }
+            firedTargets.Clear();
         }
+        readonly HashSet<TargetInfo> guardFiredTargets = [];
         int MissileID = 0;
 
         static readonly int pointDefenseAntiradThreatType = RadarWarningReceiver.RWRThreatTypes.MissileLock.ToBits();

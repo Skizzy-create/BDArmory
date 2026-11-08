@@ -295,14 +295,13 @@ namespace BDArmory.FX
 
             if (PartsOnFire.ContainsKey(hitPart.vessel) && PartsOnFire[hitPart.vessel].Count >= MaxFiresPerVessel)
             {
-                var firesOnVessel = PartsOnFire[hitPart.vessel];
-
-                firesOnVessel.Where(x => (Time.time - x) > FireLifeTimeInSeconds).Select(x => firesOnVessel.Remove(x));
+                // Note: expired fires are only cleared by CleanPartsOnFireInfo (competition start). The lazy LINQ expression that was here was never enumerated, so it removed nothing and only allocated.
                 return false;
             }
 
             if (!PartsOnFire.ContainsKey(hitPart.vessel))
             {
+                PruneDestroyedVesselsOnFire(); // PartsOnFire is static and was otherwise only cleaned at competition start, keeping every vessel that ever caught fire alive (across scene changes too).
                 List<float> firesList = new List<float> { Time.time };
 
                 PartsOnFire.Add(hitPart.vessel, firesList);
@@ -324,6 +323,18 @@ namespace BDArmory.FX
                 if (PartsOnFire[key].Count == 0) { keysToRemove.Add(key); } // Remove parts no longer on fire.
             }
             PartsOnFire = PartsOnFire.Where(kvp => kvp.Key != null && !keysToRemove.Contains(kvp.Key)).ToDictionary(kvp => kvp.Key, kvp => kvp.Value); // Remove null keys (vessels) and those with no parts on fire.
+        }
+
+        static readonly List<Vessel> destroyedVesselsOnFire = [];
+        /// <summary>
+        /// Remove destroyed vessels from PartsOnFire without changing the fire counts of the living ones.
+        /// </summary>
+        static void PruneDestroyedVesselsOnFire()
+        {
+            foreach (var vessel in PartsOnFire.Keys)
+                if (vessel == null) destroyedVesselsOnFire.Add(vessel); // Unity null check: the vessel has been destroyed.
+            for (int i = 0; i < destroyedVesselsOnFire.Count; ++i) PartsOnFire.Remove(destroyedVesselsOnFire[i]);
+            destroyedVesselsOnFire.Clear();
         }
 
         void Awake()
@@ -566,6 +577,7 @@ namespace BDArmory.FX
 
         public static void DisableAllFX()
         {
+            PartsOnFire.Clear(); // Leaving the flight scene: the vessels are reloaded as new objects, so these entries can't match any more and would only keep the old vessels alive.
             if (leakFXPool != null && leakFXPool.pool != null)
             {
                 if (BDArmorySettings.DEBUG_OTHER) Debug.Log($"[BDArmory.BulletHitFX]: Setting {leakFXPool.pool.Count(leak => leak != null && leak.activeInHierarchy)} leak FX inactive.");

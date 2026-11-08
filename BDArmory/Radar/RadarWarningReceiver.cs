@@ -228,6 +228,9 @@ namespace BDArmory.Radar
 
         public void EnableRWR()
         {
+            // Remove first so repeated calls don't stack subscriptions on these static events (OnDestroy only removes one, so extras would keep the part alive for the rest of the session).
+            OnRadarPing -= ReceivePing;
+            OnMissileLaunch -= ReceiveLaunchWarning;
             OnRadarPing += ReceivePing;
             OnMissileLaunch += ReceiveLaunchWarning;
             rwrEnabled = true;

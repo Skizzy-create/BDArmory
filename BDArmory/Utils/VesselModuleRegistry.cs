@@ -123,6 +123,60 @@ namespace BDArmory.Utils
             updateModuleCallbacks.Clear();
             vesselPartCounts.Clear();
         }
+
+        void Update()
+        {
+            if (Time.time < nextDeadVesselPruneTime) return;
+            nextDeadVesselPruneTime = Time.time + DeadVesselPruneInterval;
+            PruneDestroyedVessels();
+        }
+        #endregion
+
+        #region Dead vessel pruning
+        // The registries are keyed by Vessel and were otherwise only cleaned when a competition starts, so every vessel queried during a flight scene
+        // (spawned craft, fired missiles, debris) was kept alive, with its parts and modules, until the scene ended.
+        // The getters return early for destroyed or unloaded vessels without adding them, so pruned vessels don't get re-added.
+        const float DeadVesselPruneInterval = 10f;
+        float nextDeadVesselPruneTime = 0f;
+        static readonly List<Vessel> deadVesselKeys = [];
+
+        /// <summary>
+        /// Remove the entries of destroyed vessels from the registries.
+        /// </summary>
+        /// <returns>The number of registry entries removed.</returns>
+        public static int PruneDestroyedVessels()
+        {
+            int pruned = PruneDestroyedVesselKeys(registry);
+            pruned += PruneDestroyedVesselKeys(registryMissileFire);
+            pruned += PruneDestroyedVesselKeys(registryMissileBase);
+            pruned += PruneDestroyedVesselKeys(registryBDModulePilotAI);
+            pruned += PruneDestroyedVesselKeys(registryBDModuleSurfaceAI);
+            pruned += PruneDestroyedVesselKeys(registryIBDAIControl);
+            pruned += PruneDestroyedVesselKeys(registryModuleWeapon);
+            pruned += PruneDestroyedVesselKeys(registryIBDWeapon);
+            pruned += PruneDestroyedVesselKeys(registryModuleEngines);
+            pruned += PruneDestroyedVesselKeys(registryModuleIntakes);
+            pruned += PruneDestroyedVesselKeys(registryModuleCommand);
+            pruned += PruneDestroyedVesselKeys(registryKerbalSeat);
+            pruned += PruneDestroyedVesselKeys(registryKerbalEVA);
+            pruned += PruneDestroyedVesselKeys(registryRepulsorModule);
+            pruned += PruneDestroyedVesselKeys(registryModuleHMD);
+            pruned += PruneDestroyedVesselKeys(registryNamedModuleParts);
+            pruned += PruneDestroyedVesselKeys(vesselPartCounts);
+            if (pruned > 0 && BDArmorySettings.DEBUG_OTHER) Debug.Log($"[BDArmory.VesselModuleRegistry]: Removed {pruned} registry entries of destroyed vessels.");
+            return pruned;
+        }
+
+        static int PruneDestroyedVesselKeys<T>(Dictionary<Vessel, T> dict)
+        {
+            if (dict == null || dict.Count == 0) return 0;
+            foreach (var vessel in dict.Keys)
+                if (vessel == null) deadVesselKeys.Add(vessel); // Unity null check: the vessel has been destroyed.
+            int count = deadVesselKeys.Count;
+            for (int i = 0; i < count; ++i) dict.Remove(deadVesselKeys[i]);
+            deadVesselKeys.Clear(); // Don't hold onto the dead vessels.
+            return count;
+        }
         #endregion
 
         #region Private methods
@@ -1153,6 +1207,10 @@ namespace BDArmory.Utils
         public override void OnLoadVessel()
         {
             base.OnLoadVessel();
+            // KSP's EventData.Add and TimingManager.FixedUpdateAdd don't check for duplicates and Remove only removes one copy, so remove first in case OnLoadVessel runs again without an unload.
+            GameEvents.onVesselPartCountChanged.Remove(OnVesselPartCountChanged);
+            TimingManager.FixedUpdateRemove(TimingManager.TimingStage.Precalc, UpdateModules);
+            TimingManager.FixedUpdateRemove(TimingManager.TimingStage.ObscenelyEarly, GetVesselName);
             GameEvents.onVesselPartCountChanged.Add(OnVesselPartCountChanged);
             TimingManager.FixedUpdateAdd(TimingManager.TimingStage.Precalc, UpdateModules);
             TimingManager.FixedUpdateAdd(TimingManager.TimingStage.ObscenelyEarly, GetVesselName);

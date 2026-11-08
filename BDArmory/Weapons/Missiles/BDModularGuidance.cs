@@ -1714,10 +1714,8 @@ namespace BDArmory.Weapons.Missiles
 
         void OnDisable()
         {
-            if (TargetingMode == TargetingModes.AntiRad)
-            {
-                RadarWarningReceiver.OnRadarPing -= ReceiveRadarPing;
-            }
+            // Unsubscribe regardless of the current mode (the targeting mode can change after subscribing); removing a handler that isn't subscribed does nothing.
+            RadarWarningReceiver.OnRadarPing -= ReceiveRadarPing;
         }
 
         public Vector3 StartDirection { get; set; }

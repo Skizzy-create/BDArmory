@@ -1241,8 +1241,10 @@ namespace BDArmory.UI
                         set.Clear();
                         set.UnionWith(team.Current.Value);
                     }
+                FiredMissiles?.RemoveAll(IsDestroyedWeapon); // Missiles that are destroyed without their part dying (unloaded, removed as debris, etc.) were otherwise kept until the end of the scene.
             }
         }
+        static readonly Predicate<IBDWeapon> IsDestroyedWeapon = weapon => weapon is null || (weapon is UnityEngine.Object obj && obj == null);
 
         void RemoveTarget(TargetInfo target, BDTeam team)
         {

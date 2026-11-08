@@ -174,6 +174,19 @@ namespace BDArmory.Damage
         public Dictionary<int, Shader> defaultShader = [];
         public Dictionary<int, Color> defaultColor = [];
         public bool RegisterProcWingShader = false;
+        readonly List<Material> instancedMaterials = []; // Material copies created by our Renderer.material accesses in flight. Unity doesn't destroy these with the renderer (only on the next scene change), so they're destroyed with the part.
+
+        /// <summary>
+        /// Get the renderer's material instance (as Renderer.material does), remembering it if this call created the copy so that it can be destroyed with the part.
+        /// Only done in flight, where parts are always instantiated from the prefab (in the editor, copied parts are cloned from live parts and can share a copy until they make their own).
+        /// </summary>
+        Material GetMaterialInstance(Renderer renderer)
+        {
+            var shared = renderer.sharedMaterial;
+            var material = renderer.material;
+            if (HighLogic.LoadedSceneIsFlight && material != null && !ReferenceEquals(material, shared)) instancedMaterials.Add(material); // Only copies made just now are ours to destroy.
+            return material;
+        }
 
         public float defenseMutator = 1;
 
@@ -577,13 +590,14 @@ namespace BDArmory.Damage
                 for (int i = 0; i < r.Length; i++)
                 {
                     if (r[i].GetComponentInParent<Part>() != part) continue; // Don't recurse to child parts.
-                    int key = r[i].material.GetInstanceID(); // The instance ID is unique for each object (not just component or gameObject).
+                    var material = GetMaterialInstance(r[i]);
+                    int key = material.GetInstanceID(); // The instance ID is unique for each object (not just component or gameObject).
                     if (defaultShader.ContainsKey(key)) continue;
-                    defaultShader.Add(key, r[i].material.shader); //This doesn't grab part variants - parts with variants that are switched to will not register in defaultShader, and render as black in the RCS window
-                    if (BDArmorySettings.DEBUG_HP) Debug.Log($"[BDArmory.HitpointTracker]: part shader on {r[i].GetComponentInParent<Part>().partInfo.name} is {r[i].material.shader.name}");
-                    if (r[i].material.HasProperty("_Color"))
+                    defaultShader.Add(key, material.shader); //This doesn't grab part variants - parts with variants that are switched to will not register in defaultShader, and render as black in the RCS window
+                    if (BDArmorySettings.DEBUG_HP) Debug.Log($"[BDArmory.HitpointTracker]: part shader on {r[i].GetComponentInParent<Part>().partInfo.name} is {material.shader.name}");
+                    if (material.HasProperty("_Color"))
                     {
-                        if (!defaultColor.ContainsKey(key)) defaultColor.Add(key, r[i].material.color);
+                        if (!defaultColor.ContainsKey(key)) defaultColor.Add(key, material.color);
                     }
                 }
             }
@@ -597,6 +611,10 @@ namespace BDArmory.Damage
             if (bottom != null) bottom = null;
             if (top != null) top = null;
             GameEvents.onPartDie.Remove(OnPartDie);
+            // The part is being destroyed (or has died: Part.Die deactivates the part before onPartDie), so its renderers no longer need these copies.
+            for (int i = 0; i < instancedMaterials.Count; ++i)
+                if (instancedMaterials[i] != null) Destroy(instancedMaterials[i]);
+            instancedMaterials.Clear();
         }
 
         void OnPartDie() { OnPartDie(part); }
@@ -1723,15 +1741,16 @@ namespace BDArmory.Damage
             for (int i = 0; i < r.Length; i++)
             {
                 if (r[i].GetComponentInParent<Part>() != part) continue; // Don't recurse to child parts.
-                int key = r[i].material.GetInstanceID(); // The instance ID is unique for each object (not just component or gameObject).
+                var material = GetMaterialInstance(r[i]);
+                int key = material.GetInstanceID(); // The instance ID is unique for each object (not just component or gameObject).
                 if (!defaultShader.ContainsKey(key))
                 {
-                    defaultShader.Add(key, r[i].material.shader); //grab materials for part variant variants when switching to that variant
-                    if (BDArmorySettings.DEBUG_HP) Debug.Log($"[BDArmory.HitpointTracker]: part shader on {r[i].GetComponentInParent<Part>().partInfo.name} is {r[i].material.shader.name}");
+                    defaultShader.Add(key, material.shader); //grab materials for part variant variants when switching to that variant
+                    if (BDArmorySettings.DEBUG_HP) Debug.Log($"[BDArmory.HitpointTracker]: part shader on {r[i].GetComponentInParent<Part>().partInfo.name} is {material.shader.name}");
                 }
-                if (r[i].material.HasProperty("_Color"))
+                if (material.HasProperty("_Color"))
                 {
-                    if (!defaultColor.ContainsKey(key)) defaultColor.Add(key, r[i].material.color);
+                    if (!defaultColor.ContainsKey(key)) defaultColor.Add(key, material.color);
                 }
             }
         }

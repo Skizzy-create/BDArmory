@@ -502,7 +502,9 @@ namespace BDArmory.Extensions
                 Debug.LogWarning($"[BDArmory.PartExtension]: {part.name} has no MeshFilter! Returning zero size.");
                 return Vector3.zero;
             }
-            var size = meshFilter.mesh.bounds.size;
+            // Use sharedMesh: MeshFilter.mesh silently clones the mesh on first access (one copy per part, only freed at the next scene change). The bounds are the same.
+            var mesh = meshFilter.sharedMesh;
+            var size = mesh != null ? mesh.bounds.size : Vector3.zero;
 
             // if (part.name.Contains("B9.Aero.Wing.Procedural")) // Covered by SuicidalInsanity's patch.
             // {

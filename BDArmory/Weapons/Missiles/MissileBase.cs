@@ -973,6 +973,7 @@ namespace BDArmory.Weapons.Missiles
         {
             if (TargetingMode == TargetingModes.AntiRad && TargetAcquired)
             {
+                RadarWarningReceiver.OnRadarPing -= ReceiveRadarPing; // Avoid double subscriptions (this can be called again on switching to terminal guidance); the static event would otherwise keep the missile alive.
                 RadarWarningReceiver.OnRadarPing += ReceiveRadarPing;
             }
         }
