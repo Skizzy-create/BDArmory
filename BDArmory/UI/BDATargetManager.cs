@@ -1230,17 +1230,23 @@ namespace BDArmory.UI
             {
                 yield return new WaitForSeconds(5);
 
+                bool reportLost = OnTargetLost != null; // [Overdrive F10] Only track the removals when someone listens.
                 using (var team = TargetDatabase.GetEnumerator())
                     while (team.MoveNext())
                     {
-                        team.Current.Value.RemoveAll(target => target == null);
-                        team.Current.Value.RemoveAll(target => target.Team == team.Current.Key);
-                        team.Current.Value.RemoveAll(target => !target.isThreat);
+                        if (reportLost) CleanTeamDatabaseReportingLost(team.Current.Key, team.Current.Value);
+                        else
+                        {
+                            team.Current.Value.RemoveAll(target => target == null);
+                            team.Current.Value.RemoveAll(target => target.Team == team.Current.Key);
+                            team.Current.Value.RemoveAll(target => !target.isThreat);
+                        }
                         // Keep the membership set in sync with the list.
                         var set = TargetSet(team.Current.Key);
                         set.Clear();
                         set.UnionWith(team.Current.Value);
                     }
+                if (reportLost) RaisePendingTargetsLost(); // After the enumeration: a handler may touch the database.
                 FiredMissiles?.RemoveAll(IsDestroyedWeapon); // Missiles that are destroyed without their part dying (unloaded, removed as debris, etc.) were otherwise kept until the end of the scene.
             }
         }
@@ -1256,7 +1262,10 @@ namespace BDArmory.UI
         #region Overdrive F10: target database events
         /// <summary>[Overdrive F10] Raised when a target is first added to a team's target database (target, team that detected it).</summary>
         public static event Action<TargetInfo, BDTeam> OnTargetDetected;
-        /// <summary>[Overdrive F10] Raised when a target is explicitly removed from a team's target database (target, team). Bulk clean-ups of destroyed or non-threat targets aren't reported.</summary>
+        /// <summary>
+        /// [Overdrive F10] Raised when a target leaves a team's target database (target, team): an explicit RemoveTarget (vessel died, changed team, GM kill)
+        /// or the periodic clean-up (every 5 s) of destroyed, same-team and non-threat targets. The target may already be destroyed (Unity-null). ClearDatabase is not reported.
+        /// </summary>
         public static event Action<TargetInfo, BDTeam> OnTargetLost;
 
         static void RaiseTargetEvent(Action<TargetInfo, BDTeam> handler, TargetInfo target, BDTeam team, string name)
@@ -1265,17 +1274,56 @@ namespace BDArmory.UI
             try { handler(target, team); }
             catch (Exception e) { Debug.LogError($"[BDArmory.BDATargetManager]: {name} handler threw: {e}"); }
         }
+
+        static readonly List<KeyValuePair<TargetInfo, BDTeam>> pendingTargetsLost = [];
+        static bool raisingTargetsLost = false;
+
+        /// <summary>CleanDatabaseRoutine's clean-up of one team, queueing each removed target for OnTargetLost. Same removals and resulting order as the stock RemoveAll calls.</summary>
+        static void CleanTeamDatabaseReportingLost(BDTeam team, List<TargetInfo> list)
+        {
+            int write = 0;
+            for (int read = 0; read < list.Count; ++read)
+            {
+                var target = list[read];
+                if (target == null || target.Team == team || !target.isThreat) // Unity-null first, so a destroyed target is never dereferenced.
+                {
+                    if (!ReferenceEquals(target, null)) pendingTargetsLost.Add(new KeyValuePair<TargetInfo, BDTeam>(target, team));
+                    continue;
+                }
+                list[write++] = target;
+            }
+            if (write < list.Count) list.RemoveRange(write, list.Count - write);
+        }
+
+        /// <summary>Raise OnTargetLost for the queued removals. Re-entrant calls (a handler removing a target) append to the queue, which the outer call drains.</summary>
+        static void RaisePendingTargetsLost()
+        {
+            if (raisingTargetsLost || pendingTargetsLost.Count == 0) return;
+            raisingTargetsLost = true;
+            try
+            {
+                for (int i = 0; i < pendingTargetsLost.Count; ++i)
+                    RaiseTargetEvent(OnTargetLost, pendingTargetsLost[i].Key, pendingTargetsLost[i].Value, nameof(OnTargetLost));
+            }
+            finally
+            {
+                pendingTargetsLost.Clear();
+                raisingTargetsLost = false;
+            }
+        }
         #endregion
 
         public static void RemoveTarget(TargetInfo target)
         {
+            bool reportLost = OnTargetLost != null; // [Overdrive F10]
             using (var db = TargetDatabase.GetEnumerator())
                 while (db.MoveNext())
                 {
                     bool removed = db.Current.Value.Remove(target);
                     TargetSet(db.Current.Key).Remove(target);
-                    if (removed) RaiseTargetEvent(OnTargetLost, target, db.Current.Key, nameof(OnTargetLost)); // [Overdrive F10]
+                    if (removed && reportLost) pendingTargetsLost.Add(new KeyValuePair<TargetInfo, BDTeam>(target, db.Current.Key));
                 }
+            if (reportLost) RaisePendingTargetsLost(); // [Overdrive F10] Raised after the enumeration: a handler may touch the database.
         }
 
         public static void ReportVessel(Vessel v, MissileFire reporter, bool radar = false, bool initialSetup = false)

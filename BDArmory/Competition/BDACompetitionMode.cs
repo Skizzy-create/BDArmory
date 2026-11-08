@@ -391,7 +391,10 @@ namespace BDArmory.Competition
 
         /// <summary>[Overdrive F10] Raised when a competition starts (after the start sequence).</summary>
         public static event Action OnCompetitionStarted;
-        /// <summary>[Overdrive F10] Raised when a competition is stopped (after the results are logged and the state is reset).</summary>
+        /// <summary>
+        /// [Overdrive F10] Raised when a started competition is stopped (after the results are logged and the state is reset). Paired with OnCompetitionStarted:
+        /// not raised by StopCompetition calls when no competition was running (scene changes, failed starts, cancelled start sequences).
+        /// </summary>
         public static event Action OnCompetitionEnded;
 
         static void RaiseCompetitionEvent(Action handler, string name)
@@ -403,6 +406,7 @@ namespace BDArmory.Competition
 
         public void StopCompetition()
         {
+            bool wasActive = competitionIsActive; // [Overdrive F10] OnCompetitionEnded only after OnCompetitionStarted.
             if (ContinuousSpawning.Instance.vesselsSpawningContinuously) Scores.deathOrder.Clear(); // Clear the death order in cts spawning mode as we don't want to show it in the LVS.
             if (LoadedVesselSwitcher.Instance is not null) LoadedVesselSwitcher.Instance.ResetDeadVessels(); // Reset the dead vessels in the LVS so that the final corrected results are shown.
             LogResults(tag: competitionTag);
@@ -446,7 +450,7 @@ namespace BDArmory.Competition
                 LoadedVesselSwitcher.Instance.StopVesselTracing();
             if (BDArmorySettings.TIME_OVERRIDE)
             { Time.timeScale = 1f; }
-            RaiseCompetitionEvent(OnCompetitionEnded, nameof(OnCompetitionEnded)); // [Overdrive F10]
+            if (wasActive) RaiseCompetitionEvent(OnCompetitionEnded, nameof(OnCompetitionEnded)); // [Overdrive F10]
         }
 
         void CompetitionStarted()
