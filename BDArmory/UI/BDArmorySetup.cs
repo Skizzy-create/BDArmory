@@ -2552,6 +2552,30 @@ namespace BDArmory.UI
         }
 
         (float, float)[] asteroidFieldAltitude;
+
+        #region Debris clean-up delay slider
+        // 1 s steps from 1 s to 60 s, then 15 s steps up to 900 s (15 min).
+        const float debrisCleanupDelayMax = 900f;
+        const float debrisCleanupDelayFineMax = 60f; // Slider positions 0-59 are 1-60 s.
+        const float debrisCleanupDelayCoarseStep = 15f;
+        static float DebrisCleanupDelayToSlider(float delay) => delay <= debrisCleanupDelayFineMax
+            ? Mathf.Max(delay, 1f) - 1f
+            : debrisCleanupDelayFineMax - 1f + (Mathf.Min(delay, debrisCleanupDelayMax) - debrisCleanupDelayFineMax) / debrisCleanupDelayCoarseStep;
+        static float DebrisCleanupDelayFromSlider(float position) => position <= debrisCleanupDelayFineMax - 1f
+            ? position + 1f
+            : debrisCleanupDelayFineMax + debrisCleanupDelayCoarseStep * (position - (debrisCleanupDelayFineMax - 1f));
+        /// <summary>
+        /// Slider for DEBRIS_CLEANUP_DELAY. The value only changes when the slider is moved, so a delay set in
+        /// settings.cfg (above the slider's range or between its steps) is kept until the user drags the slider.
+        /// </summary>
+        static float DebrisCleanupDelaySlider(Rect rect, float delay)
+        {
+            float position = Mathf.Round(DebrisCleanupDelayToSlider(delay));
+            float newPosition = Mathf.Round(GUI.HorizontalSlider(rect, position, 0f, DebrisCleanupDelayToSlider(debrisCleanupDelayMax)));
+            return newPosition != position ? DebrisCleanupDelayFromSlider(newPosition) : delay;
+        }
+        #endregion
+
         void WindowSettings(int windowID)
         {
             float line = 0.25f; // Top internal margin.
@@ -3486,7 +3510,7 @@ namespace BDArmory.UI
                 if (BDArmorySettings.ADVANCED_USER_SETTINGS)
                 {
                     GUI.Label(SLeftSliderRect(++line), $"{StringUtils.Localize("#LOC_BDArmory_Settings_DebrisCleanUpDelay")}:  ({BDArmorySettings.DEBRIS_CLEANUP_DELAY}s)", leftLabel); // Debris Clean-up delay
-                    BDArmorySettings.DEBRIS_CLEANUP_DELAY = Mathf.Round(GUI.HorizontalSlider(SRightSliderRect(line), BDArmorySettings.DEBRIS_CLEANUP_DELAY, 1f, 60f));
+                    BDArmorySettings.DEBRIS_CLEANUP_DELAY = DebrisCleanupDelaySlider(SRightSliderRect(line), BDArmorySettings.DEBRIS_CLEANUP_DELAY);
 
                     GUI.Label(SLeftSliderRect(++line), $"{StringUtils.Localize("#LOC_BDArmory_Settings_CompetitionNonCompetitorRemovalDelay")}:  ({(BDArmorySettings.COMPETITION_NONCOMPETITOR_REMOVAL_DELAY > 60 ? StringUtils.Localize("#LOC_BDArmory_Generic_Off") : BDArmorySettings.COMPETITION_NONCOMPETITOR_REMOVAL_DELAY + "s")})", leftLabel); // Non-competitor removal frequency
                     BDArmorySettings.COMPETITION_NONCOMPETITOR_REMOVAL_DELAY = Mathf.Round(GUI.HorizontalSlider(SRightSliderRect(line), BDArmorySettings.COMPETITION_NONCOMPETITOR_REMOVAL_DELAY, 1f, 61f));
