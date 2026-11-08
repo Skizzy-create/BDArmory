@@ -215,6 +215,7 @@ namespace BDArmory.Control
             pilotOn = false;
             if (activeVessel)
                 activeVessel.OnFlyByWire -= autoPilot;
+            ResetPatrolEngage(); // [Overdrive F6b] No engagement survives the AI being switched off.
             RefreshPartWindow();
 
             if (speedController)
@@ -533,6 +534,7 @@ namespace BDArmory.Control
         public void ClearWaypoints()
         {
             if (BDArmorySettings.DEBUG_AI) Debug.Log("[BDArmory.BDGenericAIBase]: Cleared waypoints");
+            ++waypointRouteGeneration; // [Overdrive F6]
             if (customWaypointRoute) EndCustomWaypointRoute();
             ResetPatrolEngage(); // [Overdrive F6b]
             this.waypoints = null;
@@ -541,6 +543,7 @@ namespace BDArmory.Control
 
         public void SetWaypoints(List<Vector3> waypoints)
         {
+            ++waypointRouteGeneration; // [Overdrive F6]
             if (waypoints == null || waypoints.Count == 0)
             {
                 if (customWaypointRoute) EndCustomWaypointRoute(); // [Overdrive F6]
@@ -604,9 +607,11 @@ namespace BDArmory.Control
                 return false;
             }
             if (!pilotEnabled) return false; // Like the stock commands, nothing happens without an active AI; report it instead of failing silently.
+            ++waypointRouteGeneration;
             if (customWaypointRoute) EndCustomWaypointRoute();
             ResetPatrolEngage();
             customWaypointRoute = true;
+            customGateArmed = true;
             customWaypointRadius = radiusM > 0 ? radiusM : DefaultCustomWaypointRadius;
             customWaypointRadii.Clear();
             if (radii != null) for (int i = 0; i < radii.Count; ++i) customWaypointRadii.Add(radii[i]);
@@ -687,51 +692,68 @@ namespace BDArmory.Control
             }
         }
 
+        int waypointRouteGeneration = 0; // Bumped whenever the waypoints are set or cleared, so a handler that replaces the route from inside an event is detected.
+        bool customGateArmed = true; // False after passing the gate of a single-point route, until the vessel has left its radius (otherwise it would pass it again every frame).
+
         void UpdateCustomWaypoint()
         {
-            var waypoint = waypoints[activeWaypointIndex];
-            var terrainAltitude = FlightGlobals.currentMainBody.TerrainAltitude(waypoint.x, waypoint.y);
-            waypointPosition = FlightGlobals.currentMainBody.GetWorldSurfacePosition(waypoint.x, waypoint.y, waypoint.z + terrainAltitude);
-            waypointRange = (float)(vesselTransform.position - waypointPosition).magnitude;
-            var timeToCPA = AIUtils.TimeToCPA(vessel.transform.position - waypointPosition, vessel.Velocity(), vessel.acceleration, Time.fixedDeltaTime);
-            if (waypointRange >= CurrentWaypointRadius() || timeToCPA >= Time.fixedDeltaTime) return;
-            int reachedIndex = activeWaypointIndex, reachedLap = activeWaypointLap;
-            if (BDArmorySettings.DEBUG_AI) Debug.Log($"[BDArmory.BDGenericAIBase]: {vessel.vesselName} reached custom waypoint {reachedIndex} (lap {reachedLap}/{waypointLapLimit})");
-            ++activeWaypointIndex;
-            bool completed = false;
-            if (activeWaypointIndex >= waypoints.Count)
+            // At most one lap of gates per physics frame (overlapping gates are passed in the same frame, as stock); a loop rather than recursion, so huge lap counts can't overflow the stack.
+            for (int passed = 0; passed <= waypoints.Count; ++passed)
             {
-                activeWaypointIndex = 0;
-                activeWaypointLap++;
-                completed = activeWaypointLap > waypointLapLimit;
-            }
-            if (OnCustomWaypointReached != null)
-            {
-                try { OnCustomWaypointReached(this, reachedIndex, reachedLap); }
-                catch (System.Exception e) { Debug.LogError($"[BDArmory.BDGenericAIBase]: OnCustomWaypointReached handler threw: {e}"); }
-            }
-            if (completed)
-            {
-                if (BDArmorySettings.DEBUG_AI) Debug.Log("[BDArmory.BDGenericAIBase]: Custom waypoint route complete");
-                bool guardAtEnd = customWaypointGuardAtEnd;
-                waypoints = null;
-                activeWaypointIndex = -1;
-                EndCustomWaypointRoute();
-                ReleaseCommand();
-                if (guardAtEnd)
+                var waypoint = waypoints[activeWaypointIndex];
+                var terrainAltitude = FlightGlobals.currentMainBody.TerrainAltitude(waypoint.x, waypoint.y);
+                waypointPosition = FlightGlobals.currentMainBody.GetWorldSurfacePosition(waypoint.x, waypoint.y, waypoint.z + terrainAltitude);
+                waypointRange = (float)(vesselTransform.position - waypointPosition).magnitude;
+                if (passed == waypoints.Count) return; // A whole lap of gates passed this frame: aim at the next one, check it next frame.
+                float radius = CurrentWaypointRadius();
+                if (!customGateArmed)
                 {
-                    var weaponManager = WeaponManager;
-                    if (weaponManager != null && !weaponManager.guardMode) weaponManager.guardMode = true;
+                    if (waypointRange < radius) return;
+                    customGateArmed = true;
                 }
-                if (OnCustomWaypointRouteCompleted != null)
+                var timeToCPA = AIUtils.TimeToCPA(vessel.transform.position - waypointPosition, vessel.Velocity(), vessel.acceleration, Time.fixedDeltaTime);
+                if (waypointRange >= radius || timeToCPA >= Time.fixedDeltaTime) return;
+                int reachedIndex = activeWaypointIndex, reachedLap = activeWaypointLap;
+                if (BDArmorySettings.DEBUG_AI) Debug.Log($"[BDArmory.BDGenericAIBase]: {vessel.vesselName} reached custom waypoint {reachedIndex} (lap {reachedLap}/{waypointLapLimit})");
+                ++activeWaypointIndex;
+                bool completed = false;
+                if (activeWaypointIndex >= waypoints.Count)
                 {
-                    try { OnCustomWaypointRouteCompleted(this); }
-                    catch (System.Exception e) { Debug.LogError($"[BDArmory.BDGenericAIBase]: OnCustomWaypointRouteCompleted handler threw: {e}"); }
+                    activeWaypointIndex = 0;
+                    activeWaypointLap++;
+                    completed = activeWaypointLap > waypointLapLimit;
                 }
-                return;
+                if (activeWaypointIndex == reachedIndex) customGateArmed = false; // Single-point route: leave the gate before it counts again.
+                if (OnCustomWaypointReached != null)
+                {
+                    int generation = waypointRouteGeneration;
+                    try { OnCustomWaypointReached(this, reachedIndex, reachedLap); }
+                    catch (System.Exception e) { Debug.LogError($"[BDArmory.BDGenericAIBase]: OnCustomWaypointReached handler threw: {e}"); }
+                    if (generation != waypointRouteGeneration) return; // The handler set or cleared the waypoints: leave the new state alone.
+                }
+                if (completed)
+                {
+                    if (BDArmorySettings.DEBUG_AI) Debug.Log("[BDArmory.BDGenericAIBase]: Custom waypoint route complete");
+                    bool guardAtEnd = customWaypointGuardAtEnd;
+                    ++waypointRouteGeneration;
+                    waypoints = null;
+                    activeWaypointIndex = -1;
+                    EndCustomWaypointRoute();
+                    ReleaseCommand();
+                    if (guardAtEnd)
+                    {
+                        var weaponManager = WeaponManager;
+                        if (weaponManager != null && !weaponManager.guardMode) weaponManager.guardMode = true;
+                    }
+                    if (OnCustomWaypointRouteCompleted != null)
+                    {
+                        try { OnCustomWaypointRouteCompleted(this); }
+                        catch (System.Exception e) { Debug.LogError($"[BDArmory.BDGenericAIBase]: OnCustomWaypointRouteCompleted handler threw: {e}"); }
+                    }
+                    return;
+                }
+                ApplyCustomWaypointSpeed(); // Then recompute for the new waypoint.
             }
-            ApplyCustomWaypointSpeed();
-            UpdateCustomWaypoint(); // Recompute for the new waypoint.
         }
         #endregion
 
@@ -744,8 +766,16 @@ namespace BDArmory.Control
         public bool waypointsYieldToCombat = false;
         /// <summary>[Overdrive F6b] Maximum distance in metres from the patrol anchor while engaging (0: unlimited).</summary>
         public float patrolLeashDistance = 0f;
-        /// <summary>[Overdrive F6b] Patrol anchor as (latitude, longitude, altitude ASL). Vector3d.zero: the current waypoint.</summary>
+        /// <summary>
+        /// [Overdrive F6b] Patrol anchor as (latitude, longitude, altitude ASL). Vector3d.zero (default): where the engagement began, i.e. where the AI left its route
+        /// (reused by an engagement that starts within 10 s of the last resume, so back-to-back chases can't creep away from the route).
+        /// </summary>
         public Vector3d patrolAnchor = Vector3d.zero;
+        /// <summary>[Overdrive F6b] The leash anchor of the current engagement as (latitude, longitude, altitude ASL): patrolAnchor if set, else where the engagement began. Vector3d.zero when not engaged.</summary>
+        public Vector3d PatrolLeashAnchor => !PatrolEngaged ? Vector3d.zero : patrolAnchor != Vector3d.zero ? patrolAnchor : patrolEngageStartGeo;
+        Vector3d patrolEngageStartGeo = Vector3d.zero; // Geographic, so it survives floating-origin shifts during a long chase.
+        float patrolLastResumeTime = float.NegativeInfinity;
+        const float PatrolAnchorReuseS = 10f;
         /// <summary>[Overdrive F6b] Seconds a target whose chase broke the leash is ignored for patrol engagement.</summary>
         public float patrolLeashCooldown = 30f;
         /// <summary>[Overdrive F6b] Whether the AI has broken off its waypoints to engage.</summary>
@@ -765,6 +795,7 @@ namespace BDArmory.Control
         /// <summary>
         /// [Overdrive F6b] Whether to skip the waypoints and attack the guard target this frame. Call when waypointsYieldToCombat or PatrolEngaged is set (ends the engagement when the flag was cleared).
         /// Hold fire authority never yields; Tight yields only for targets fire authority permits (assigned or passing the ExternalTargetFilter); Free yields for any target.
+        /// A vessel without weapons or ammo stays on its route (it would otherwise ram or orbit with its waypoint index frozen).
         /// </summary>
         protected bool PatrolShouldEngage()
         {
@@ -774,10 +805,14 @@ namespace BDArmory.Control
                 && weaponManager.fireAuthority != FireAuthority.Hold
                 && (weaponManager.fireAuthority == FireAuthority.Free || weaponManager.FireAuthorityPermits(target));
             if (engage && target == patrolLeashBrokenTarget && Time.time < patrolLeashBrokenUntil) engage = false;
+            if (engage && !weaponManager.HasWeaponsAndAmmo()) engage = false;
+            if (engage && !PatrolEngaged && (patrolEngageStartGeo == Vector3d.zero || Time.time - patrolLastResumeTime > PatrolAnchorReuseS))
+                patrolEngageStartGeo = new Vector3d(vessel.latitude, vessel.longitude, vessel.altitude); // The leash anchor when patrolAnchor isn't set.
             bool leashBroken = false;
             if (engage && patrolLeashDistance > 0)
             {
-                var anchor = patrolAnchor == Vector3d.zero ? waypointPosition : (Vector3)FlightGlobals.currentMainBody.GetWorldSurfacePosition(patrolAnchor.x, patrolAnchor.y, patrolAnchor.z);
+                var anchorGeo = patrolAnchor != Vector3d.zero ? patrolAnchor : patrolEngageStartGeo;
+                var anchor = (Vector3)FlightGlobals.currentMainBody.GetWorldSurfacePosition(anchorGeo.x, anchorGeo.y, anchorGeo.z);
                 if ((vessel.CoM - anchor).sqrMagnitude > patrolLeashDistance * patrolLeashDistance)
                 {
                     engage = false;
@@ -811,7 +846,8 @@ namespace BDArmory.Control
         {
             PatrolEngaged = false;
             PatrolTarget = null;
-            if (BDArmorySettings.DEBUG_AI) Debug.Log($"[BDArmory.BDGenericAIBase]: {vessel.vesselName} resuming its waypoints{(leashBroken ? " (leash)" : "")}.");
+            patrolLastResumeTime = Time.time;
+            if (BDArmorySettings.DEBUG_AI) Debug.Log($"[BDArmory.BDGenericAIBase]: {(vessel != null ? vessel.vesselName : "null")} resuming its waypoints{(leashBroken ? " (leash)" : "")}.");
             if (OnPatrolResume != null)
             {
                 try { OnPatrolResume(this, leashBroken); }
@@ -819,9 +855,10 @@ namespace BDArmory.Control
             }
         }
 
-        /// <summary>End a patrol engagement when the waypoints stop (cleared, completed or replaced).</summary>
+        /// <summary>End a patrol engagement when the waypoints stop (cleared, completed, replaced, no longer the command) or the AI is deactivated, and forget the leash anchor.</summary>
         protected void ResetPatrolEngage()
         {
+            patrolEngageStartGeo = Vector3d.zero;
             if (PatrolEngaged) EndPatrolEngage(false);
         }
         #endregion

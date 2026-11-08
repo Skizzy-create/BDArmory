@@ -2152,7 +2152,8 @@ namespace BDArmory.Control
 
             UpdateVelocityRelativeDirections();
             CheckLandingGear();
-            if (IsRunningWaypoints && !PatrolEngaged) UpdateWaypoint(); // Update the waypoint state. ([Overdrive F6b] Frozen while engaging so the patrol resumes at the same waypoint.)
+            if (IsRunningWaypoints) { if (!PatrolEngaged) UpdateWaypoint(); } // Update the waypoint state. ([Overdrive F6b] Frozen while engaging so the patrol resumes at the same waypoint.)
+            else if (PatrolEngaged) ResetPatrolEngage(); // [Overdrive F6b] The waypoints stopped being the command (another order, released): end the engagement.
 
             wasGainingAlt = gainingAlt; gainingAlt = false;
             if (!vessel.LandedOrSplashed && ((!(ramming && steerMode == SteerModes.Manoeuvering) && FlyAvoidTerrain(s)) || (!ramming && FlyAvoidOthers(s)))) // Avoid terrain and other planes, unless we're trying to ram stuff.
