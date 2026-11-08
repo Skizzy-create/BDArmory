@@ -389,6 +389,18 @@ namespace BDArmory.Competition
             if (BDArmorySettings.VESSEL_MOVER_CLOSE_ON_COMPETITION_START && BDArmorySetup.showVesselMoverGUI) VesselMover.Instance.SetVisible(false);
         }
 
+        /// <summary>[Overdrive F10] Raised when a competition starts (after the start sequence).</summary>
+        public static event Action OnCompetitionStarted;
+        /// <summary>[Overdrive F10] Raised when a competition is stopped (after the results are logged and the state is reset).</summary>
+        public static event Action OnCompetitionEnded;
+
+        static void RaiseCompetitionEvent(Action handler, string name)
+        {
+            if (handler == null) return;
+            try { handler(); }
+            catch (Exception e) { Debug.LogError($"[BDArmory.BDACompetitionMode]: {name} handler threw: {e}"); }
+        }
+
         public void StopCompetition()
         {
             if (ContinuousSpawning.Instance.vesselsSpawningContinuously) Scores.deathOrder.Clear(); // Clear the death order in cts spawning mode as we don't want to show it in the LVS.
@@ -434,6 +446,7 @@ namespace BDArmory.Competition
                 LoadedVesselSwitcher.Instance.StopVesselTracing();
             if (BDArmorySettings.TIME_OVERRIDE)
             { Time.timeScale = 1f; }
+            RaiseCompetitionEvent(OnCompetitionEnded, nameof(OnCompetitionEnded)); // [Overdrive F10]
         }
 
         void CompetitionStarted()
@@ -449,6 +462,7 @@ namespace BDArmory.Competition
             decisionTick = BDArmorySettings.COMPETITION_KILLER_GM_FREQUENCY > 60 ? -1 : competitionStartTime + BDArmorySettings.COMPETITION_KILLER_GM_FREQUENCY; // every 60 seconds we do nasty things
             finalGracePeriodStart = -1;
             Debug.Log("[BDArmory.BDACompetitionMode:" + CompetitionID.ToString() + "]: Competition Started");
+            RaiseCompetitionEvent(OnCompetitionStarted, nameof(OnCompetitionStarted)); // [Overdrive F10]
         }
 
         public void ResetCompetitionStuff(string tag = "", bool preSpawn = false)

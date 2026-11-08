@@ -28,6 +28,28 @@ namespace BDArmory.Competition
         public int deathCount = 0;
         public List<string> deathOrder = new List<string>(); // The names of dead players ordered by their death.
         public string currentlyIT = "";
+
+        #region Overdrive F10: scoring events
+        /// <summary>[Overdrive F10] Raised after a hit is scored during a competition (attacker, victim, damage type, parts hit (1 for a bullet hit)).</summary>
+        public static event Action<string, string, DamageFrom, int> OnHit;
+        /// <summary>[Overdrive F10] Raised after a death is scored during a competition (victim, last attacker ("" if none), last damage type, alive state).</summary>
+        public static event Action<string, string, DamageFrom, AliveState> OnDeath;
+
+        void RaiseOnHit(string attacker, string victim, DamageFrom damageFrom, int partsHit)
+        {
+            if (OnHit == null) return;
+            try { OnHit(attacker, victim, damageFrom, partsHit); }
+            catch (Exception e) { Debug.LogError($"[BDArmory.Scoring]: OnHit handler threw: {e}"); }
+        }
+
+        void RaiseOnDeath(string victim)
+        {
+            if (OnDeath == null) return;
+            var data = ScoreData[victim];
+            try { OnDeath(victim, data.lastPersonWhoDamagedMe ?? "", data.lastDamageWasFrom, data.aliveState); }
+            catch (Exception e) { Debug.LogError($"[BDArmory.Scoring]: OnDeath handler threw: {e}"); }
+        }
+        #endregion
         public CompetitionResult competitionResult = CompetitionResult.Draw;
         public List<List<string>> survivingTeams = new List<List<string>>();
         public List<List<string>> deadTeams = new List<List<string>>();
@@ -164,6 +186,7 @@ namespace BDArmory.Competition
                 BDACompetitionMode.Instance.s4r1FiringRateUpdatedFromHitThisFrame = true;
             }
 
+            RaiseOnHit(attacker, victim, DamageFrom.Guns, 1); // [Overdrive F10]
             return true;
         }
         /// <summary>
@@ -281,6 +304,7 @@ namespace BDArmory.Competition
 
             if (BDArmorySettings.REMOTE_LOGGING_ENABLED)
             { BDAScoreService.Instance.TrackRocketParts(attacker, victim, partsHit); }
+            RaiseOnHit(attacker, victim, DamageFrom.Rockets, partsHit); // [Overdrive F10]
             return true;
         }
         /// <summary>
@@ -374,6 +398,7 @@ namespace BDArmory.Competition
 
             if (BDArmorySettings.REMOTE_LOGGING_ENABLED)
             { BDAScoreService.Instance.TrackRammedParts(attacker, victim, partsLost); }
+            RaiseOnHit(attacker, victim, DamageFrom.Ramming, partsLost); // [Overdrive F10]
             return true;
         }
         /// <summary>
@@ -435,6 +460,7 @@ namespace BDArmory.Competition
 
             if (BDArmorySettings.REMOTE_LOGGING_ENABLED)
             { BDAScoreService.Instance.TrackMissileParts(attacker, victim, partsHit); }
+            RaiseOnHit(attacker, victim, DamageFrom.Missiles, partsHit); // [Overdrive F10]
             return true;
         }
         /// <summary>
@@ -514,6 +540,7 @@ namespace BDArmory.Competition
                 ScoreData[vesselName].aliveState = AliveState.Dead;
                 if (gmKillReason == GMKillReason.None)
                 { ScoreData[vesselName].lastDamageWasFrom = DamageFrom.Incompetence; }
+                RaiseOnDeath(vesselName); // [Overdrive F10]
                 return true;
             }
 
@@ -545,6 +572,7 @@ namespace BDArmory.Competition
             }
             if (ContinuousSpawning.Instance.vesselsSpawningContinuously) ContinuousSpawning.Instance.DumpContinuousSpawningScores();
 
+            RaiseOnDeath(vesselName); // [Overdrive F10]
             return true;
         }
         /// <summary>

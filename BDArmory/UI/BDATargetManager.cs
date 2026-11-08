@@ -1248,17 +1248,33 @@ namespace BDArmory.UI
 
         void RemoveTarget(TargetInfo target, BDTeam team)
         {
-            TargetDatabase[team].Remove(target);
+            bool removed = TargetDatabase[team].Remove(target);
             TargetSet(team).Remove(target);
+            if (removed) RaiseTargetEvent(OnTargetLost, target, team, nameof(OnTargetLost)); // [Overdrive F10]
         }
+
+        #region Overdrive F10: target database events
+        /// <summary>[Overdrive F10] Raised when a target is first added to a team's target database (target, team that detected it).</summary>
+        public static event Action<TargetInfo, BDTeam> OnTargetDetected;
+        /// <summary>[Overdrive F10] Raised when a target is explicitly removed from a team's target database (target, team). Bulk clean-ups of destroyed or non-threat targets aren't reported.</summary>
+        public static event Action<TargetInfo, BDTeam> OnTargetLost;
+
+        static void RaiseTargetEvent(Action<TargetInfo, BDTeam> handler, TargetInfo target, BDTeam team, string name)
+        {
+            if (handler == null) return;
+            try { handler(target, team); }
+            catch (Exception e) { Debug.LogError($"[BDArmory.BDATargetManager]: {name} handler threw: {e}"); }
+        }
+        #endregion
 
         public static void RemoveTarget(TargetInfo target)
         {
             using (var db = TargetDatabase.GetEnumerator())
                 while (db.MoveNext())
                 {
-                    db.Current.Value.Remove(target);
+                    bool removed = db.Current.Value.Remove(target);
                     TargetSet(db.Current.Key).Remove(target);
+                    if (removed) RaiseTargetEvent(OnTargetLost, target, db.Current.Key, nameof(OnTargetLost)); // [Overdrive F10]
                 }
         }
 
@@ -1342,6 +1358,7 @@ namespace BDArmory.UI
             if (set.Add(target))
             {
                 list.Add(target);
+                RaiseTargetEvent(OnTargetDetected, target, reportingTeam, nameof(OnTargetDetected)); // [Overdrive F10]
             }
         }
 
