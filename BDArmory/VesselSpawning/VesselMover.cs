@@ -637,7 +637,8 @@ namespace BDArmory.VesselSpawning
 
             // Choose crew
             crewCapacity = GetCrewCapacity(craftFile, out vesselNameToSpawn);
-            if (BDArmorySettings.VESSEL_MOVER_CHOOSE_CREW)
+            bool multiSpawn = MultiSpawnRequested; // [Overdrive OD1]
+            if (BDArmorySettings.VESSEL_MOVER_CHOOSE_CREW && !multiSpawn)
             { yield return ChooseCrew(); }
             messageState = Messages.None;
 
@@ -645,6 +646,13 @@ namespace BDArmory.VesselSpawning
             yield return GetSpawnPoint();
             messageState = Messages.None;
             if (geoCoords == Vector3d.zero) { state = State.None; yield break; }
+
+            if (multiSpawn) // [Overdrive OD1] N copies in a line, with clear-space finding.
+            {
+                yield return MultiSpawnVessels(craftFile, geoCoords);
+                state = State.None;
+                yield break;
+            }
 
             // Store the camera view
             var camera = FlightCamera.fetch;
@@ -881,6 +889,323 @@ namespace BDArmory.VesselSpawning
         public override IEnumerator Spawn(SpawnConfig spawnConfig) { yield break; } // Compliance with SpawnStrategy kludge.
         #endregion
 
+        #region Overdrive OD1: multi-spawn
+        enum MultiSpawnMode { Ground, Sea, Air }
+        /// <summary>Multi-spawn is used for a count above 1 or for an air spawn. Count 1 on the surface is the stock single spawn.</summary>
+        public static bool MultiSpawnRequested => BDArmorySettings.VESSEL_MOVER_SPAWN_COUNT > 1 || BDArmorySettings.VESSEL_MOVER_SPAWN_AIR;
+        bool multiSpawnInProgress = false;
+        int multiSpawnTotal = 0, multiSpawnDone = 0, multiSpawnFailed = 0;
+        string multiSpawnWarning = "";
+
+        /// <summary>
+        /// The craft's size from the craft file's "size" value (x: width, y: height, z: length in the SPH frame), its part count and its editor facility.
+        /// </summary>
+        static Vector3 GetCraftSize(string craftFile, out int partCount, out bool isVAB)
+        {
+            partCount = 0;
+            isVAB = false;
+            var size = new Vector3(10f, 5f, 10f); // Fallback if the craft file has no size.
+            try
+            {
+                var node = ConfigNode.Load(craftFile);
+                if (node != null)
+                {
+                    var sizeString = node.GetValue("size");
+                    if (!string.IsNullOrEmpty(sizeString))
+                    {
+                        var parsed = ConfigNode.ParseVector3(sizeString);
+                        if (parsed.x > 0 && parsed.y > 0 && parsed.z > 0) size = parsed;
+                    }
+                    isVAB = node.GetValue("type") == "VAB";
+                    partCount = node.GetNodes("PART").Length;
+                }
+            }
+            catch (Exception e) { Debug.LogWarning($"[BDArmory.VesselMover]: Failed to read the size of {craftFile}: {e.Message}"); }
+            return size;
+        }
+
+        /// <summary>
+        /// Spawn VESSEL_MOVER_SPAWN_COUNT copies of the craft in a line (abreast or in trail, wrapping into rows) around the chosen point,
+        /// after checking every slot for clear space (terrain, buildings, land or water, existing vessels). Spawns one vessel at a time, staggered over frames.
+        /// Algorithm: skizzy-protocol 06-flight-control.md §9.1, layout and planning in MultiSpawnLayout.
+        /// </summary>
+        IEnumerator MultiSpawnVessels(string craftFile, Vector3d spawnGeoCoords)
+        {
+            var body = FlightGlobals.currentMainBody;
+            int count = Math.Max(1, BDArmorySettings.VESSEL_MOVER_SPAWN_COUNT);
+            bool air = BDArmorySettings.VESSEL_MOVER_SPAWN_AIR;
+            var direction = BDArmorySettings.VESSEL_MOVER_SPAWN_TRAIL ? MultiSpawnLineDirection.Trail : MultiSpawnLineDirection.Abreast;
+            float heading = BDArmorySettings.VESSEL_MOVER_SPAWN_HEADING;
+            double airAltitude = BDArmorySettings.VESSEL_MOVER_SPAWN_ALTITUDE;
+
+            // Craft size and spacing.
+            var size = GetCraftSize(craftFile, out int partCount, out bool isVAB);
+            float width = isVAB ? Mathf.Max(size.x, size.z) : size.x;
+            float length = isVAB ? Mathf.Max(size.x, size.z) : size.z;
+            float height = size.y;
+            float alongLine = direction == MultiSpawnLineDirection.Abreast ? width : length;
+            float acrossLine = direction == MultiSpawnLineDirection.Abreast ? length : width;
+            double spacing = BDArmorySettings.VESSEL_MOVER_SPAWN_SPACING > 0 ? BDArmorySettings.VESSEL_MOVER_SPAWN_SPACING : MultiSpawnLayout.AutoSpacing(alongLine, air);
+            double rowSpacing = MultiSpawnLayout.RowSpacing(spacing, acrossLine);
+            int perRow = MultiSpawnLayout.PerRow(count, spacing, BDArmorySettings.VESSEL_MOVER_SPAWN_PER_ROW, MultiSpawnLayout.DefaultMaxRowLength);
+            float craftRadius = 0.5f * Mathf.Sqrt(width * width + length * length + (isVAB ? height * height : 0));
+            float margin = (float)MultiSpawnLayout.AutoMargin(Mathf.Max(width, length), air);
+            double minSeparation = Math.Min(spacing, alongLine + 2.0);
+
+            // The spawn frame at the chosen point.
+            var centre = body.GetWorldSurfacePosition(spawnGeoCoords.x, spawnGeoCoords.y, spawnGeoCoords.z);
+            var up = (centre - body.transform.position).normalized;
+            var north = VectorUtils.GetNorthVector(centre, body);
+            var forward = (Quaternion.AngleAxis(heading, up) * north).ProjectOnPlanePreNormalized(up).normalized;
+            var right = Vector3.Cross(up, forward);
+            MultiSpawnMode mode = air ? MultiSpawnMode.Air : (body.ocean && body.TerrainAltitude(spawnGeoCoords.x, spawnGeoCoords.y, true) < 0 ? MultiSpawnMode.Sea : MultiSpawnMode.Ground);
+            float speed = BDArmorySettings.VESSEL_MOVER_SPAWN_SPEED;
+            float pathSpeed = air ? (speed > 0 ? speed : 150f) : 0f; // For the air path check when the speed comes from the AI.
+
+            // Plan the slots.
+            var plan = MultiSpawnLayout.Plan(count, direction, spacing, rowSpacing, perRow, minSeparation,
+                offset => MultiSpawnSlotFree(body, centre + right * (float)offset.right + forward * (float)offset.forward, forward, mode, craftRadius, height, margin, airAltitude, pathSpeed));
+            if (plan.status == MultiSpawnStatus.NoClearSpace || plan.status == MultiSpawnStatus.InvalidCount)
+            {
+                var reason = plan.status == MultiSpawnStatus.InvalidCount ? "invalid count" : $"no clear space within {MultiSpawnLayout.DefaultMaxSearchRadius / 1000:0} km (best spot: {plan.bestFreeSlots}/{count} slots free)";
+                ShowMultiSpawnMessage($"Multi-spawn cancelled: {reason}.", true);
+                yield break;
+            }
+            var slotGeoCoords = new List<Vector3d>(count);
+            var slotDirections = new List<Vector3>(count);
+            foreach (var offset in plan.slots)
+            {
+                var slotWorld = centre + right * (float)offset.right + forward * (float)offset.forward;
+                body.GetLatLonAlt(slotWorld, out double lat, out double lon, out _);
+                slotGeoCoords.Add(new Vector3d(lat, lon, 0));
+                var slotUp = (slotWorld - body.transform.position).normalized;
+                slotDirections.Add((Quaternion.AngleAxis(heading, slotUp) * VectorUtils.GetNorthVector(slotWorld, body)).ProjectOnPlanePreNormalized(slotUp).normalized);
+            }
+
+            // Warnings.
+            multiSpawnWarning = "";
+            if (count > MultiSpawnLayout.LargeSpawnWarningThreshold)
+            {
+                long loadedParts = 0;
+                foreach (var v in FlightGlobals.VesselsLoaded) if (v != null) loadedParts += v.parts.Count;
+                long addedParts = (long)partCount * count;
+                double frameMs = MultiSpawnLayout.EstimatePhysicsMs(loadedParts + addedParts);
+                string rangeNote = "";
+                var activeVessel = FlightGlobals.ActiveVessel;
+                if (activeVessel != null)
+                {
+                    float range = air ? activeVessel.vesselRanges.flying.load : activeVessel.vesselRanges.landed.load;
+                    int outside = 0;
+                    foreach (var offset in plan.slots)
+                        if ((centre + right * (float)offset.right + forward * (float)offset.forward - activeVessel.transform.position).magnitude > range) ++outside;
+                    rangeNote = outside > 0 ? $", {outside} outside the physics load range ({range / 1000:0.#} km)" : ", all inside the physics range";
+                }
+                multiSpawnWarning = $"Large spawn: {count} vessels, +{addedParts} parts ({FlightGlobals.VesselsLoaded.Count + count} vessels loaded after), est. {frameMs:0} ms physics per frame{rangeNote}.";
+                Debug.LogWarning($"[BDArmory.VesselMover]: {multiSpawnWarning}");
+            }
+            if (plan.status == MultiSpawnStatus.Moved) ShowMultiSpawnMessage($"Spawn point blocked: line moved {plan.MovedBy:0} m to clear space.", false);
+            else if (plan.status == MultiSpawnStatus.Shifted) ShowMultiSpawnMessage($"{plan.shiftedSlots} slot(s) shifted along the line to clear obstacles.", false);
+            if (BDArmorySettings.DEBUG_SPAWNING) Debug.Log($"[BDArmory.VesselMover]: Multi-spawn of {count} {Path.GetFileNameWithoutExtension(craftFile)} ({mode}, {direction}, spacing {spacing:0.#} m, {plan.rows} rows of {plan.perRow}, {plan.status}, {plan.checks} checks).");
+
+            // Spawn, one vessel at a time, staggered over frames.
+            multiSpawnInProgress = true;
+            multiSpawnTotal = count;
+            multiSpawnDone = 0;
+            multiSpawnFailed = 0;
+            vesselsSpawning = true;
+            int framesBetween = MultiSpawnLayout.FramesBetweenSpawns(partCount);
+            float surfaceAltitude = BDArmorySettings.VESSEL_SPAWN_ALTITUDE_;
+            int activating = 0;
+            try
+            {
+                ResetInternals();
+                for (int i = 0; i < count; ++i)
+                {
+                    spawnFailureReason = SpawnFailureReason.None;
+                    var geo = slotGeoCoords[i];
+                    double terrain = body.TerrainAltitude(geo.x, geo.y, BDArmorySettings.VESSEL_MOVER_BELOW_WATER);
+                    float altitude = mode == MultiSpawnMode.Air ? (float)Math.Max(0, airAltitude - Math.Max(0, body.TerrainAltitude(geo.x, geo.y, true))) : surfaceAltitude;
+                    var config = new VesselSpawnConfig(
+                        craftFile,
+                        body.GetWorldSurfacePosition(geo.x, geo.y, terrain),
+                        slotDirections[i],
+                        altitude,
+                        0f,
+                        airborne: mode == MultiSpawnMode.Air,
+                        inOrbit: false,
+                        deconflictVesselName: true, // Unique names for the copies (vessels with a weapon manager).
+                        crew: null
+                    );
+                    messageState = Messages.Custom;
+                    customMessage = $"Spawning {i + 1}/{count}...";
+                    yield return SpawnSingleVessel(config);
+                    if (spawnFailureReason != SpawnFailureReason.None || !spawnedVessels.TryGetValue(latestSpawnedVesselName, out Vessel vessel) || vessel == null)
+                    {
+                        ++multiSpawnFailed;
+                        Debug.LogWarning($"[BDArmory.VesselMover]: Multi-spawn copy {i + 1}/{count} failed ({spawnFailureReason}).");
+                        vesselsSpawningCount = 0; // A failed SpawnSingleVessel can leave its counter raised.
+                        continue;
+                    }
+                    var name = vessel.vesselName;
+                    var finalPosition = finalSpawnPositions.TryGetValue(name, out Vector3d p) ? p : geo;
+                    var finalRotation = finalSpawnRotations.TryGetValue(name, out Quaternion r) ? r : vessel.transform.rotation;
+                    ++activating;
+                    StartCoroutine(MultiSpawnActivate(vessel, mode, speed, finalPosition, finalRotation, () => { --activating; ++multiSpawnDone; }));
+                    for (int f = 0; f < framesBetween; ++f) yield return wait;
+                }
+                // Wait for the activations (landing or air start) to finish.
+                var tic = Time.time;
+                while (activating > 0 && Time.time - tic < 60f) yield return wait;
+            }
+            finally
+            {
+                multiSpawnInProgress = false;
+                vesselsSpawning = false;
+                spawnFailureReason = SpawnFailureReason.None;
+            }
+            int spawned = count - multiSpawnFailed;
+            ShowMultiSpawnMessage($"Multi-spawn finished: {spawned}/{count} spawned{(multiSpawnFailed > 0 ? $", {multiSpawnFailed} failed" : "")}{(plan.status == MultiSpawnStatus.Moved ? $", line moved {plan.MovedBy:0} m" : "")}.", multiSpawnFailed > 0);
+        }
+
+        /// <summary>
+        /// Put a freshly spawned copy where it should be, then lower it to the surface or start it in the air.
+        /// </summary>
+        IEnumerator MultiSpawnActivate(Vessel vessel, MultiSpawnMode mode, float speed, Vector3d finalPosition, Quaternion finalRotation, Action done)
+        {
+            try
+            {
+                var tic = Time.time;
+                while (vessel != null && !IsValid(vessel) && Time.time - tic < 10f)
+                {
+                    vessel.SetPosition(VectorUtils.GetWorldSurfacePostion(finalPosition, FlightGlobals.currentMainBody)); // Hold it in place while it loads.
+                    vessel.SetRotation(finalRotation);
+                    yield return wait;
+                }
+                if (!IsValid(vessel)) yield break;
+                vessel.SetPosition(VectorUtils.GetWorldSurfacePostion(finalPosition, FlightGlobals.currentMainBody));
+                vessel.SetRotation(finalRotation);
+                if (mode == MultiSpawnMode.Air)
+                {
+                    SpawnUtils.AirborneActivation(vessel, false);
+                    float initialSpeed = speed;
+                    if (initialSpeed <= 0)
+                    {
+                        var pilot = vessel.ActiveController().AI as BDArmory.Control.BDModulePilotAI;
+                        initialSpeed = pilot != null ? pilot.idleSpeed : 0f;
+                    }
+                    if (initialSpeed > 0) vessel.SetVelocity(initialSpeed * vessel.transform.up);
+                }
+                else
+                {
+                    if (BDArmorySettings.VESSEL_MOVER_ENABLE_SAS) vessel.ActionGroups.SetGroup(KSPActionGroup.SAS, false); // Re-enabled once lowered.
+                    if (BDArmorySettings.VESSEL_MOVER_ENABLE_BRAKES) vessel.ActionGroups.SetGroup(KSPActionGroup.Brakes, false);
+                    yield return PlaceVessel(vessel, true);
+                }
+            }
+            finally { done(); }
+        }
+
+        void ShowMultiSpawnMessage(string message, bool warning)
+        {
+            messageState = Messages.Custom;
+            customMessage = message;
+            if (warning) Debug.LogWarning($"[BDArmory.VesselMover]: {message}");
+            else Debug.Log($"[BDArmory.VesselMover]: {message}");
+        }
+
+        /// <summary>
+        /// Clear-space check for one multi-spawn slot (06-flight-control.md §9.1).
+        /// Ground: land, slope at most 10° over a 3×3 grid, no building or static under the footprint. Sea: water deeper than the craft's height + 2 m.
+        /// Air: at least max(50 m, size) above the terrain at the slot and along the first 10 s of flight. All: clear of loaded vessels by their radius + the craft's radius + margin.
+        /// </summary>
+        bool MultiSpawnSlotFree(CelestialBody body, Vector3 slotSurface, Vector3 forward, MultiSpawnMode mode, float craftRadius, float craftHeight, float margin, double airAltitude, float pathSpeed)
+        {
+            body.GetLatLonAlt(slotSurface, out double lat, out double lon, out _);
+            double terrain = body.TerrainAltitude(lat, lon, true);
+            var up = (slotSurface - body.transform.position).normalized;
+            var right = Vector3.Cross(up, forward);
+            double slotAltitude;
+            switch (mode)
+            {
+                case MultiSpawnMode.Ground:
+                    {
+                        if (body.ocean && terrain <= 0) return false; // Water.
+                        float step = Mathf.Max(craftRadius, 2f);
+                        double maxRise = Math.Tan(10 * Math.PI / 180) * step;
+                        for (int i = -1; i <= 1; ++i)
+                            for (int j = -1; j <= 1; ++j)
+                            {
+                                if (i == 0 && j == 0) continue;
+                                var p = slotSurface + right * (i * step) + forward * (j * step);
+                                body.GetLatLonAlt(p, out double pLat, out double pLon, out _);
+                                double h = body.TerrainAltitude(pLat, pLon, true);
+                                if (body.ocean && h <= 0) return false; // Part of the footprint is in the water.
+                                double distance = (i != 0 && j != 0) ? step * 1.41421356 : step;
+                                if (Math.Abs(h - terrain) > maxRise * distance / step) return false; // Too steep.
+                            }
+                        if (ObstructedByStatics(body, slotSurface, up, right, forward, craftRadius)) return false;
+                        slotAltitude = terrain;
+                        break;
+                    }
+                case MultiSpawnMode.Sea:
+                    {
+                        if (!body.ocean || terrain > -(craftHeight + 2f)) return false; // Not water, or too shallow.
+                        if (ObstructedByStatics(body, slotSurface, up, right, forward, craftRadius)) return false;
+                        slotAltitude = 0;
+                        break;
+                    }
+                default: // Air
+                    {
+                        double minClearance = Math.Max(50.0, Math.Max(craftRadius * 2f, craftHeight));
+                        if (airAltitude - Math.Max(0, terrain) < minClearance) return false;
+                        for (int t = 2; t <= 10; t += 2)
+                        {
+                            var p = slotSurface + forward * (pathSpeed * t);
+                            body.GetLatLonAlt(p, out double pLat, out double pLon, out _);
+                            if (airAltitude - Math.Max(0, body.TerrainAltitude(pLat, pLon, true)) < minClearance) return false;
+                        }
+                        slotAltitude = airAltitude;
+                        break;
+                    }
+            }
+            // Existing vessels.
+            var slotWorld = body.GetWorldSurfacePosition(lat, lon, slotAltitude);
+            foreach (var v in FlightGlobals.VesselsLoaded)
+            {
+                if (v == null) continue;
+                float clearance = v.GetRadius() + craftRadius + margin;
+                if ((v.transform.position - slotWorld).sqrMagnitude < clearance * clearance) return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Raycast down at the centre and corners of the footprint: a hit well above the terrain height means a building, static or other collider.
+        /// </summary>
+        bool ObstructedByStatics(CelestialBody body, Vector3 slotSurface, Vector3 up, Vector3 right, Vector3 forward, float craftRadius)
+        {
+            for (int k = 0; k < 5; ++k)
+            {
+                var p = k switch
+                {
+                    0 => slotSurface,
+                    1 => slotSurface + (right + forward) * craftRadius * 0.7071f,
+                    2 => slotSurface + (right - forward) * craftRadius * 0.7071f,
+                    3 => slotSurface + (-right + forward) * craftRadius * 0.7071f,
+                    _ => slotSurface + (-right - forward) * craftRadius * 0.7071f,
+                };
+                body.GetLatLonAlt(p, out double pLat, out double pLon, out _);
+                double ground = Math.Max(body.ocean ? 0 : double.MinValue, body.TerrainAltitude(pLat, pLon, true));
+                var origin = body.GetWorldSurfacePosition(pLat, pLon, ground + 500);
+                if (Physics.Raycast(origin, -up, out RaycastHit hit, 600f, (int)LayerMasks.Scenery, QueryTriggerInteraction.Ignore))
+                {
+                    if (body.GetAltitude(hit.point) > ground + 3.0) return true;
+                }
+            }
+            return false;
+        }
+        #endregion
+
         #region GUI
         static int guiCheckIndex = -1;
         bool helpShowing = false;
@@ -1025,7 +1350,10 @@ namespace BDArmory.VesselSpawning
                 case State.None:
                     {
                         if (GUILayout.Button(StringUtils.Localize("#LOC_BDArmory_VesselMover_MoveVessel"), BDArmorySetup.ButtonStyle, GUILayout.Height(40))) StartCoroutine(MoveVessel(FlightGlobals.ActiveVessel));
-                        if (GUILayout.Button(StringUtils.Localize("#LOC_BDArmory_VesselMover_SpawnVessel"), BDArmorySetup.ButtonStyle, GUILayout.Height(40))) StartCoroutine(SpawnVessel());
+                        if (multiSpawnInProgress) // [Overdrive OD1]
+                            GUILayout.Label($"Multi-spawn in progress: {multiSpawnDone}/{multiSpawnTotal}{(multiSpawnFailed > 0 ? $" ({multiSpawnFailed} failed)" : "")}", BDArmorySetup.SelectedButtonStyle, GUILayout.Height(40));
+                        else if (GUILayout.Button(MultiSpawnRequested ? $"{StringUtils.Localize("#LOC_BDArmory_VesselMover_SpawnVessel")} x{BDArmorySettings.VESSEL_MOVER_SPAWN_COUNT} ({(BDArmorySettings.VESSEL_MOVER_SPAWN_AIR ? "air, " : "")}{(BDArmorySettings.VESSEL_MOVER_SPAWN_TRAIL ? "trail" : "abreast")})" : StringUtils.Localize("#LOC_BDArmory_VesselMover_SpawnVessel"), BDArmorySetup.ButtonStyle, GUILayout.Height(40))) StartCoroutine(SpawnVessel());
+                        MultiSpawnOptionsGUI(); // [Overdrive OD1]
                         if (GUILayout.Button(StringUtils.Localize("#LOC_BDArmory_VesselMover_RecoverVessel"), BDArmorySetup.ButtonStyle, GUILayout.Height(20))) RecoverVessel();
                         GUILayout.BeginHorizontal();
                         BDArmorySettings.VESSEL_MOVER_CHOOSE_CREW = GUILayout.Toggle(BDArmorySettings.VESSEL_MOVER_CHOOSE_CREW, StringUtils.Localize("#LOC_BDArmory_VesselMover_ChooseCrew"));
@@ -1112,6 +1440,75 @@ namespace BDArmory.VesselSpawning
             GUIUtils.UpdateGUIRect(BDArmorySetup.WindowRectVesselMover, guiCheckIndex);
             GUIUtils.UseMouseEventInRect(BDArmorySetup.WindowRectVesselMover);
         }
+
+        #region Overdrive OD1: multi-spawn options
+        bool showMultiSpawnOptions = false;
+        string multiSpawnCountText, multiSpawnSpacingText, multiSpawnPerRowText, multiSpawnHeadingText, multiSpawnAltitudeText, multiSpawnSpeedText;
+        static readonly System.Globalization.CultureInfo invariant = System.Globalization.CultureInfo.InvariantCulture;
+
+        void MultiSpawnOptionsGUI()
+        {
+            if (multiSpawnCountText == null)
+            {
+                multiSpawnCountText = BDArmorySettings.VESSEL_MOVER_SPAWN_COUNT.ToString(invariant);
+                multiSpawnSpacingText = BDArmorySettings.VESSEL_MOVER_SPAWN_SPACING.ToString(invariant);
+                multiSpawnPerRowText = BDArmorySettings.VESSEL_MOVER_SPAWN_PER_ROW.ToString(invariant);
+                multiSpawnHeadingText = BDArmorySettings.VESSEL_MOVER_SPAWN_HEADING.ToString(invariant);
+                multiSpawnAltitudeText = BDArmorySettings.VESSEL_MOVER_SPAWN_ALTITUDE.ToString(invariant);
+                multiSpawnSpeedText = BDArmorySettings.VESSEL_MOVER_SPAWN_SPEED.ToString(invariant);
+            }
+            if (GUILayout.Button(showMultiSpawnOptions ? "Multi-spawn options [-]" : "Multi-spawn options [+]", showMultiSpawnOptions ? BDArmorySetup.SelectedButtonStyle : BDArmorySetup.ButtonStyle, GUILayout.Height(20)))
+            {
+                showMultiSpawnOptions = !showMultiSpawnOptions;
+                if (!showMultiSpawnOptions) ResetWindowHeight();
+            }
+            if (!showMultiSpawnOptions) return;
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Count", GUILayout.Width(55));
+            multiSpawnCountText = GUILayout.TextField(multiSpawnCountText, GUILayout.Width(55));
+            if (int.TryParse(multiSpawnCountText, System.Globalization.NumberStyles.Integer, invariant, out int count) && count >= 1) BDArmorySettings.VESSEL_MOVER_SPAWN_COUNT = count;
+            if (GUILayout.Button(BDArmorySettings.VESSEL_MOVER_SPAWN_TRAIL ? "In trail" : "Abreast", BDArmorySetup.ButtonStyle)) { BDArmorySettings.VESSEL_MOVER_SPAWN_TRAIL = !BDArmorySettings.VESSEL_MOVER_SPAWN_TRAIL; }
+            GUILayout.EndHorizontal();
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Spacing (m, 0 = auto)", GUILayout.Width(150));
+            multiSpawnSpacingText = GUILayout.TextField(multiSpawnSpacingText);
+            if (float.TryParse(multiSpawnSpacingText, System.Globalization.NumberStyles.Float, invariant, out float spacing) && spacing >= 0) BDArmorySettings.VESSEL_MOVER_SPAWN_SPACING = spacing;
+            GUILayout.EndHorizontal();
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Per row (0 = auto)", GUILayout.Width(150));
+            multiSpawnPerRowText = GUILayout.TextField(multiSpawnPerRowText);
+            if (int.TryParse(multiSpawnPerRowText, System.Globalization.NumberStyles.Integer, invariant, out int perRow) && perRow >= 0) BDArmorySettings.VESSEL_MOVER_SPAWN_PER_ROW = perRow;
+            GUILayout.EndHorizontal();
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Heading (deg)", GUILayout.Width(150));
+            multiSpawnHeadingText = GUILayout.TextField(multiSpawnHeadingText);
+            if (float.TryParse(multiSpawnHeadingText, System.Globalization.NumberStyles.Float, invariant, out float heading)) BDArmorySettings.VESSEL_MOVER_SPAWN_HEADING = Mathf.Repeat(heading, 360f);
+            GUILayout.EndHorizontal();
+
+            BDArmorySettings.VESSEL_MOVER_SPAWN_AIR = GUILayout.Toggle(BDArmorySettings.VESSEL_MOVER_SPAWN_AIR, "Spawn in the air");
+            if (BDArmorySettings.VESSEL_MOVER_SPAWN_AIR)
+            {
+                GUILayout.BeginHorizontal();
+                GUILayout.Label("Altitude ASL (m)", GUILayout.Width(150));
+                multiSpawnAltitudeText = GUILayout.TextField(multiSpawnAltitudeText);
+                if (float.TryParse(multiSpawnAltitudeText, System.Globalization.NumberStyles.Float, invariant, out float altitude) && altitude > 0) BDArmorySettings.VESSEL_MOVER_SPAWN_ALTITUDE = altitude;
+                GUILayout.EndHorizontal();
+                GUILayout.BeginHorizontal();
+                GUILayout.Label("Speed (m/s, 0 = AI idle)", GUILayout.Width(150));
+                multiSpawnSpeedText = GUILayout.TextField(multiSpawnSpeedText);
+                if (float.TryParse(multiSpawnSpeedText, System.Globalization.NumberStyles.Float, invariant, out float speed) && speed >= 0) BDArmorySettings.VESSEL_MOVER_SPAWN_SPEED = speed;
+                GUILayout.EndHorizontal();
+            }
+            if (BDArmorySettings.VESSEL_MOVER_SPAWN_COUNT > MultiSpawnLayout.LargeSpawnWarningThreshold)
+                GUILayout.Label($"Warning: {BDArmorySettings.VESSEL_MOVER_SPAWN_COUNT} vessels is a large spawn and may slow the game down a lot. It will still go ahead.");
+            if (!string.IsNullOrEmpty(multiSpawnWarning)) GUILayout.Label(multiSpawnWarning);
+            if (!MultiSpawnRequested) GUILayout.Label("Count 1 on the surface uses the normal single spawn.");
+        }
+        #endregion
 
         /// <summary>
         /// Reset the height of the window so that it shrinks.

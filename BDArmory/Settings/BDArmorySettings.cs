@@ -381,6 +381,15 @@ namespace BDArmory.Settings
         [BDAPersistentSettingsField] public static bool VESSEL_MOVER_DONT_WORRY_ABOUT_COLLISIONS = false; // Don't prevent collisions.
         [BDAPersistentSettingsField] public static bool VESSEL_MOVER_CLOSE_ON_COMPETITION_START = true; // Close when starting a competition.
         [BDAPersistentSettingsField] public static bool VESSEL_MOVER_PLACE_AFTER_SPAWN = false;    // Immediately place vessels after spawning them.
+        // Overdrive OD1: multi-spawn. Count 1 with air spawn off is the stock single spawn.
+        [BDAPersistentSettingsField] public static int VESSEL_MOVER_SPAWN_COUNT = 1;               // Number of copies to spawn (no cap; a warning above 50).
+        [BDAPersistentSettingsField] public static bool VESSEL_MOVER_SPAWN_TRAIL = false;          // Line in trail (along the heading) instead of abreast.
+        [BDAPersistentSettingsField] public static float VESSEL_MOVER_SPAWN_SPACING = 0f;          // Spacing between copies in metres (0: auto from the craft's size).
+        [BDAPersistentSettingsField] public static int VESSEL_MOVER_SPAWN_PER_ROW = 0;             // Copies per row (0: auto, wrapping at 2 km).
+        [BDAPersistentSettingsField] public static float VESSEL_MOVER_SPAWN_HEADING = 90f;         // Heading of the line's craft in degrees.
+        [BDAPersistentSettingsField] public static bool VESSEL_MOVER_SPAWN_AIR = false;            // Spawn in the air (same altitude, heading and initial speed).
+        [BDAPersistentSettingsField] public static float VESSEL_MOVER_SPAWN_ALTITUDE = 1000f;      // Air spawn altitude above sea level in metres.
+        [BDAPersistentSettingsField] public static float VESSEL_MOVER_SPAWN_SPEED = 0f;            // Air spawn initial speed in m/s (0: the pilot AI's idle speed).
         #endregion
 
         #region Scores
