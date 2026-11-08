@@ -157,6 +157,7 @@
     <Compile Include="Control\BDModuleSurfaceAI.cs" />
     <Compile Include="Control\BDModuleVTOLAI.cs" />
     <Compile Include="Control\IBDAIControl.cs" />
+    <Compile Include="Control\FireAuthority.cs" />
     <Compile Include="Control\MissileFire.cs" />
     <Compile Include="Control\ModuleWingCommander.cs" />
     <Compile Include="CounterMeasure\CMBubble.cs" />
@@ -333,6 +334,7 @@
     <Compile Include="VesselSpawning\CircularSpawning.cs" />
     <Compile Include="VesselSpawning\ContinuousSpawning.cs" />
     <Compile Include="VesselSpawning\CustomSpawnTemplate.cs" />
+    <Compile Include="VesselSpawning\MultiSpawnLayout.cs" />
     <Compile Include="VesselSpawning\SingleVesselSpawning.cs" />
     <Compile Include="VesselSpawning\SpawnConfig.cs" />
     <Compile Include="VesselSpawning\SpawnLocations.cs" />
