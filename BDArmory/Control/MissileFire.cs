@@ -4865,6 +4865,31 @@ namespace BDArmory.Control
 
         #region Fire
 
+        #region Overdrive F9: missile fire API
+        /// <summary>[Overdrive F9] Raised after this mod's weapon managers launch a missile through FireCurrentMissile or a parallel salvo (weapon manager, missile, target vessel (may be null)). Rails and turrets may launch a different missile from the same mount.</summary>
+        public static event Action<MissileFire, MissileBase, Vessel> OnMissileFired;
+
+        void RaiseOnMissileFired(MissileBase missile, Vessel targetVessel)
+        {
+            if (OnMissileFired == null) return;
+            try { OnMissileFired(this, missile, targetVessel); }
+            catch (Exception e) { Debug.LogError($"[BDArmory.MissileFire]: OnMissileFired handler threw: {e}"); }
+        }
+
+        /// <summary>
+        /// [Overdrive F9] Fire a specific missile on this vessel at a target vessel. Fire authority applies while guard mode is on.
+        /// With checkClearance, a blocked missile may be swapped for an identical one with clearance (stock behaviour).
+        /// EMP and nuclear warheads are refused while guard mode has no current target (their blast stand-off logic needs one).
+        /// </summary>
+        /// <returns>Whether a missile was launched.</returns>
+        public bool FireMissileAt(MissileBase missile, Vessel target, bool checkClearance = true)
+        {
+            if (missile == null || missile.vessel != vessel || missile.launched || missile.HasFired) return false;
+            if ((missile.warheadType == MissileBase.WarheadTypes.EMP || missile.warheadType == MissileBase.WarheadTypes.Nuke) && guardMode && (currentTarget == null || guardTarget == null)) return false;
+            return FireCurrentMissile(missile, checkClearance, target);
+        }
+        #endregion
+
         bool FireCurrentMissile(MissileBase missile, bool checkClearance, Vessel targetVessel = null, TargetData targetData = null)
         {
             if (missile == null) return false;
@@ -4949,6 +4974,7 @@ namespace BDArmory.Control
 
             //PreviousMissile = CurrentMissile;
             ++guardMissilesFiredCount; // Lets the parallel salvo tell whether GuardMissileRoutineCore fired.
+            RaiseOnMissileFired(missile, targetVessel); // [Overdrive F9]
             UpdateList();
             if (DisengageAfterFiring)
             {
@@ -10152,7 +10178,11 @@ namespace BDArmory.Control
                 missile.FireMissile();
                 PreviousMissile = missile;
             }
-            if (missile.launched || missile.HasFired) ++guardMissilesFiredCount;
+            if (missile.launched || missile.HasFired)
+            {
+                ++guardMissilesFiredCount;
+                RaiseOnMissileFired(missile, targetVessel); // [Overdrive F9]
+            }
         }
         #endregion Parallel salvo
 
