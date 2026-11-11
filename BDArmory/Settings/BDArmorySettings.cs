@@ -100,6 +100,8 @@ namespace BDArmory.Settings
         [BDAPersistentSettingsField] public static bool RADAR_ALLOW_SURFACE_WARFARE = true;
         [BDAPersistentSettingsField] public static bool RADAR_LOCKS_FOLLOW_MULTITARGET = true; // In guard mode, lock-capable radars can lock as many targets as the weapon manager's multi-target settings (instead of being limited to the part's maxLocks).
         [BDAPersistentSettingsField] public static bool MISSILE_RETARGETING = true;            // Missiles whose target is destroyed retarget the nearest remaining hostile within their seeker/guidance capability.
+        [BDAPersistentSettingsField] public static bool PERF_PROBE = false;                    // [Overdrive perf] Record per-frame timings to GameData/BDArmory/PluginData/PerfProbe/*.csv in the flight scene (read when the flight scene starts).
+        [BDAPersistentSettingsField] public static int GUARD_SCAN_INTERVAL = 1;                // [Overdrive perf] Run each weapon manager's guard view scan (incoming missiles, gun threats, countermeasures) every N physics frames, staggered between craft. 1 = every frame (stock).
         [BDAPersistentSettingsField] public static float RADAR_NOTCHING_FACTOR = 1f;
         [BDAPersistentSettingsField] public static float RADAR_NOTCHING_SCR_FACTOR = 0.01f;
         [BDAPersistentSettingsField] public static bool DISPLAY_PATHING_GRID = false;             //laggy when the grid gets large

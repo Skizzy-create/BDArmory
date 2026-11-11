@@ -2066,6 +2066,7 @@ namespace BDArmory.Control
 
         public override void OnUpdate()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.WeaponManagerUpdate); // [Overdrive perf]
             base.OnUpdate();
 
             if (!HighLogic.LoadedSceneIsFlight)
@@ -2729,6 +2730,7 @@ namespace BDArmory.Control
         }
         public override void OnFixedUpdate()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.WeaponManagerFixed); // [Overdrive perf]
             base.OnFixedUpdate();
 
             if (vessel == null || !vessel.gameObject.activeInHierarchy) return;
@@ -2760,6 +2762,7 @@ namespace BDArmory.Control
 
         void PointDefence()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.WeaponManagerPD); // [Overdrive perf]
             if (vessel.IsControllable)
             {
                 if (Time.time - PDScanTimer > 0.1f)
@@ -2800,6 +2803,7 @@ namespace BDArmory.Control
 
         void OnGUI()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.WeaponManagerGUI); // [Overdrive perf]
             if (!IsPrimaryWM) return; // Don't do anything if we're not in control.
             if (!BDArmorySettings.DEBUG_LINES && lr != null) { lr.enabled = false; }
             if (HighLogic.LoadedSceneIsFlight && vessel == FlightGlobals.ActiveVessel &&
@@ -6157,6 +6161,7 @@ namespace BDArmory.Control
 
         void SmartFindTarget()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.TargetSelection); // [Overdrive perf]
             bool multiTargeting = multiTargetNum > 1 || multiMissileTgtNum > 1;
             if (ExternalSecondaryTargets != null || externalSecondaryList.Count > 0) RefreshExternalSecondaryTargets(); // [Overdrive F2] Once per scan, before selection (Tight authority uses the snapshot).
             deferSecondaryTargets = multiTargeting; // SetTarget is called for each candidate target; only find the secondary targets once the primary target is settled.
@@ -8843,6 +8848,7 @@ namespace BDArmory.Control
         public Dictionary<Vessel, float> detectedTargetTimeout = [];
         public Dictionary<Vessel, bool> staleTarget = new Dictionary<Vessel, bool>();
         Dictionary<Vessel, string> staleTargetDebugString = new Dictionary<Vessel, string>();
+        static bool StaleTargetDebugWanted => BDArmorySettings.DEBUG_TELEMETRY || BDArmorySettings.DEBUG_AI || BDArmorySettings.DEBUG_WEAPONS; // [Overdrive perf] The stale target strings are only shown in these debug displays; skip formatting them (with allocations) otherwise.
 
         FloatCurve SurfaceVisionOffset = null;
         public enum TargetVisibility
@@ -8861,6 +8867,7 @@ namespace BDArmory.Control
         /// <returns></returns>
         public TargetVisibility CanSeeTarget(TargetInfo target, bool checkForNonVisualDetection = true, bool checkForstaleTarget = true)
         {
+            using var _perf = PerfProbe.Scope(PerfSection.CanSeeTarget); // [Overdrive perf]
             // fix cheating: we can see a target IF we either have a visual on it, OR it has been detected on radar/sonar/IRST
             // but to prevent AI from stopping an engagement just because a target dropped behind a small hill 5 seconds ago, clamp the timeout to 30 seconds
             // i.e. let's have at least some object permanence :)
@@ -8931,7 +8938,7 @@ namespace BDArmory.Control
                             if (BDArmorySettings.DEBUG_AI) Debug.Log($"[BDArmory.MissileFire]: Distant tgt {target.name} last seen {Time.time - detectedTime} seconds ago. Recalling last known position");
                             detectedTargetTimeout.Add(target.Vessel, Time.time - detectedTime);
                             staleTarget.Add(target.Vessel, true);
-                            staleTargetDebugString.Add(target.Vessel, $" {target.name} seen {Time.time - detectedTime:0.00}s ago at long range");
+                            if (StaleTargetDebugWanted) staleTargetDebugString.Add(target.Vessel, $" {target.name} seen {Time.time - detectedTime:0.00}s ago at long range");
                             return TargetVisibility.RecentlyVisible;
                         }
                         staleTarget.Add(target.Vessel, true);
@@ -8948,7 +8955,7 @@ namespace BDArmory.Control
                             if (BDArmorySettings.DEBUG_AI) Debug.Log($"[BDArmory.MissileFire]: {target.name} last seen {Time.time - detectedTime} seconds ago. Recalling last known position");
                             detectedTargetTimeout.Add(target.Vessel, Time.time - detectedTime);
                             staleTarget.Add(target.Vessel, true);
-                            staleTargetDebugString.Add(target.Vessel, $" {target.name} seen {Time.time - detectedTime:0.00}s ago at close range");
+                            if (StaleTargetDebugWanted) staleTargetDebugString.Add(target.Vessel, $" {target.name} seen {Time.time - detectedTime:0.00}s ago at close range");
                             return TargetVisibility.RecentlyVisible;
                         }
                         staleTarget.Add(target.Vessel, true);
@@ -8969,7 +8976,7 @@ namespace BDArmory.Control
                     if (BDArmorySettings.DEBUG_AI) Debug.Log($"[BDArmory.MissileFire]: {target.name} last detected {Time.time - detectedTime} seconds ago. Recalling last known position");
                     detectedTargetTimeout.Add(target.Vessel, Time.time - detectedTime);
                     staleTarget.Add(target.Vessel, true);
-                    staleTargetDebugString.Add(target.Vessel, $" {target.name} seen {Time.time - detectedTime:0.00}s ago ({(target.Vessel.CoM - vessel.CoM).magnitude:0.0}m/{visDistance:0.0}m, {VectorUtils.Angle(-vessel.ReferenceTransform.forward, target.Vessel.CoM - vessel.CoM):0.0}°/{guardAngle * 1.1f / 2:0.0}°)");
+                    if (StaleTargetDebugWanted) staleTargetDebugString.Add(target.Vessel, $" {target.name} seen {Time.time - detectedTime:0.00}s ago ({(target.Vessel.CoM - vessel.CoM).magnitude:0.0}m/{visDistance:0.0}m, {VectorUtils.Angle(-vessel.ReferenceTransform.forward, target.Vessel.CoM - vessel.CoM):0.0}°/{guardAngle * 1.1f / 2:0.0}°)");
                     return TargetVisibility.RecentlyVisible;
                 }
                 return TargetVisibility.NotVisible; //target long gone
@@ -10411,8 +10418,10 @@ namespace BDArmory.Control
             }
         }
 
+        ScanStagger guardScanStagger; // [Overdrive perf] GUARD_SCAN_INTERVAL.
         void UpdateGuardViewScan()
         {
+            if (!guardScanStagger.Tick(part.persistentId, Mathf.Clamp(BDArmorySettings.GUARD_SCAN_INTERVAL, 1, 10))) return; // [Overdrive perf] Every GUARD_SCAN_INTERVAL (1-10) physics frames (staggered between craft), keeping the last results in between. 1 (default): every frame.
             staleTargetDebugString.Clear();
             results = RadarUtils.GuardScanInDirection(this, transform, guardAngle, guardRange, rwr);
             incomingThreatVessel = null;

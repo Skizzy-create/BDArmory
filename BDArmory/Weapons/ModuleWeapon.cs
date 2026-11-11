@@ -2164,6 +2164,7 @@ namespace BDArmory.Weapons
 
         void Update()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.WeaponUpdate); // [Overdrive perf]
             if (HighLogic.LoadedSceneIsFlight && FlightGlobals.ready && !vessel.packed && vessel.IsControllable)
             {
                 if (lowpassFilter)
@@ -2249,6 +2250,7 @@ namespace BDArmory.Weapons
 
         void FixedUpdate()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.WeaponFixed); // [Overdrive perf]
             if (HighLogic.LoadedSceneIsFlight && !vessel.packed)
             {
                 if (!vessel.IsControllable)

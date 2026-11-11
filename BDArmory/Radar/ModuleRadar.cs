@@ -804,6 +804,7 @@ namespace BDArmory.Radar
 
         void Update()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.RadarUpdate); // [Overdrive perf]
             drawGUI = (HighLogic.LoadedSceneIsFlight && FlightGlobals.ready && !vessel.packed && radarEnabled &&
                        vessel.isActiveVessel && BDArmorySetup.GAME_UI_ENABLED && !MapView.MapIsEnabled);
         }
@@ -853,6 +854,7 @@ namespace BDArmory.Radar
 
         void FixedUpdate()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.RadarFixed); // [Overdrive perf]
             if (HighLogic.LoadedSceneIsFlight && FlightGlobals.ready && startupComplete)
             {
                 if (!vessel.IsControllable && radarEnabled)
@@ -916,6 +918,7 @@ namespace BDArmory.Radar
 
         void LateUpdate()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.RadarUpdate); // [Overdrive perf]
             if (HighLogic.LoadedSceneIsFlight && (canScan || canLock))
             {
                 UpdateModel();

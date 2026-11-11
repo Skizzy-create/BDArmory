@@ -354,6 +354,7 @@ namespace BDArmory.Radar
 
         void FixedUpdate()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.IRSTFixed); // [Overdrive perf]
             if (HighLogic.LoadedSceneIsFlight && FlightGlobals.ready && startupComplete)
             {
                 if (!vessel.IsControllable && irstEnabled)

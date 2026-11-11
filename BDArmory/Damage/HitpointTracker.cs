@@ -650,6 +650,7 @@ namespace BDArmory.Damage
 
         void FixedUpdate()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.HitpointsFixed); // [Overdrive perf]
             if (!HighLogic.LoadedSceneIsFlight) return;
             if (started) RefreshHitPoints();
 
@@ -660,7 +661,7 @@ namespace BDArmory.Damage
                     HeartBleed();
                 }
                 //if (ArmorTypeNum > 1 || ArmorPanel)
-                if (ArmorTypeNum != (ArmorInfo.armors.FindIndex(t => t.name == "None") + 1) || ArmorPanel)
+                if (ArmorTypeNum != (ArmorInfo.NoneIndex + 1) || ArmorPanel) // [Overdrive perf] Cached index (was a list search per part per frame).
                 {
                     if (part.skinTemperature > SafeUseTemp * 1.5f)
                     {

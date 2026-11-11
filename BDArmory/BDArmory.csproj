@@ -321,6 +321,9 @@
     <Compile Include="Utils\OtherUtils.cs" />
     <Compile Include="Utils\PIDUtils.cs" />
     <Compile Include="Utils\PartExploderSystem.cs" />
+    <Compile Include="Utils\PerfLogic.cs" />
+    <Compile Include="Utils\PerfProbe.cs" />
+    <Compile Include="Utils\PerfProbeRecorder.cs" />
     <Compile Include="Utils\ProjectileUtils.cs" />
     <Compile Include="Utils\ResourceUtils.cs" />
     <Compile Include="Utils\SmoothingUtils.cs" />

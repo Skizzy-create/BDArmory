@@ -143,6 +143,7 @@ namespace BDArmory.UI
 
         void Update()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.TargetManager); // [Overdrive perf]
             if (!FlightGlobals.ready) return;
 
             if (BDArmorySettings.DEBUG_TELEMETRY || BDArmorySettings.DEBUG_AI)
@@ -519,6 +520,7 @@ namespace BDArmory.UI
 
         public static TargetSignatureData GetHeatTarget(Vessel sourceVessel, Vessel missileVessel, Ray ray, TargetSignatureData priorHeatTarget, float scanRadius, float highpassThreshold, float frontAspectHeatModifier, bool uncagedLock, bool targetCoM, FloatCurve lockedSensorFOVBias, FloatCurve lockedSensorVelocityBias, FloatCurve lockedSensorVelocityMagnitudeBias, float lockedSensorMinAngularVelocity, MissileFire mf = null, TargetInfo desiredTarget = null, bool IFF = true)
         {
+            using var _perf = PerfProbe.Scope(PerfSection.HeatTarget); // [Overdrive perf]
             float minMass = missileVessel.InNearVacuum() ? 0f : 0.05f;  // FIXME, RAMs need min mass of 0.05, but orbital KKVs mass < 0.05
 
             bool priorHeatTargetExists = priorHeatTarget.exists;
@@ -1345,7 +1347,7 @@ namespace BDArmory.UI
                         {
                             info.detected[reporter.Team] = true;
                         }
-                        if (reporter.staleTarget.ContainsKey(v) && reporter.staleTarget[v]) Debug.LogError($"DEBUG {info.name} detected at {Time.time} by {reporter.vessel.GetName()} on team {reporter.Team}");
+                        if ((BDArmorySettings.DEBUG_AI || BDArmorySettings.DEBUG_RADAR) && reporter.staleTarget.ContainsKey(v) && reporter.staleTarget[v]) Debug.LogError($"DEBUG {info.name} detected at {Time.time} by {reporter.vessel.GetName()} on team {reporter.Team}"); // [Overdrive perf] Only with Debug AI/Radar: it can fire every physics frame per reporter while a target is stale.
                     }
                 }
                 else
@@ -1380,7 +1382,7 @@ namespace BDArmory.UI
                 {
                     info.detected[reporter.Team] = true; //target is under radar detection
                 }
-                if (reporter.staleTarget.ContainsKey(v) && reporter.staleTarget[v]) Debug.LogError($"DEBUG {info.name} detected at {Time.time} by {reporter.vessel.GetName()} on team {reporter.Team}");
+                if ((BDArmorySettings.DEBUG_AI || BDArmorySettings.DEBUG_RADAR) && reporter.staleTarget.ContainsKey(v) && reporter.staleTarget[v]) Debug.LogError($"DEBUG {info.name} detected at {Time.time} by {reporter.vessel.GetName()} on team {reporter.Team}"); // [Overdrive perf] Only with Debug AI/Radar: it can fire every physics frame per reporter while a target is stale.
             }
         }
 

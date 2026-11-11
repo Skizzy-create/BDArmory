@@ -1019,9 +1019,10 @@ namespace BDArmory.Utils
         public static ActiveController GetActiveController(Vessel vessel)
         {
             if (vessel == null) return null;
-            if (!registry.ContainsKey(vessel))
-                registry.Add(vessel, vessel.gameObject.GetComponent<ActiveController>());
-            return registry[vessel];
+            if (registry.TryGetValue(vessel, out var activeController)) return activeController; // [Overdrive perf] One lookup instead of two (called thousands of times per frame).
+            activeController = vessel.gameObject.GetComponent<ActiveController>();
+            registry.Add(vessel, activeController);
+            return activeController;
         }
 
         static Dictionary<Vessel, ActiveController> registry = [];

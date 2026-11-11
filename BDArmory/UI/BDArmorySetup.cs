@@ -769,6 +769,7 @@ namespace BDArmory.UI
 
         void Update()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.SetupUpdate); // [Overdrive perf]
             if (!scalingUI) BDArmorySettings.PREVIOUS_UI_SCALE = BDArmorySettings.UI_SCALE_ACTUAL;
 
             if (HighLogic.LoadedSceneIsFlight)
@@ -1021,6 +1022,7 @@ namespace BDArmory.UI
         }
         void OnGUI()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.SetupGUI); // [Overdrive perf]
             if (!GAME_UI_ENABLED) return;
             if (!stylesConfigured) ConfigureStyles();
             if (windowSettingsEnabled)

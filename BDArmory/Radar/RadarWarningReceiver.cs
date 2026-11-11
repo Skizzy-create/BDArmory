@@ -252,6 +252,7 @@ namespace BDArmory.Radar
 
         public override void OnFixedUpdate()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.RWRFixed); // [Overdrive perf]
             base.OnFixedUpdate();
 
             if (!(HighLogic.LoadedSceneIsFlight && FlightGlobals.ready)) return;

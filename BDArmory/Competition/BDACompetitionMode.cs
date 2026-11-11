@@ -2687,6 +2687,7 @@ namespace BDArmory.Competition
 
         void FixedUpdate()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.Competition); // [Overdrive perf]
             s4r1FiringRateUpdatedFromShotThisFrame = false;
             s4r1FiringRateUpdatedFromHitThisFrame = false;
             if (competitionIsActive)
