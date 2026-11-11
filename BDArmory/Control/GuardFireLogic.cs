@@ -31,6 +31,8 @@ namespace BDArmory.Control
         NoThreats,
         /// <summary>Point defence: no interceptor can engage any of the incoming missiles right now (range, seeker, lock, boresight, recent failures).</summary>
         NoInterceptor,
+        /// <summary>[Overdrive] Point defence, fleet defence: an incoming missile already has its interceptors from allied ships (in flight or claimed), see FleetDefenceRules.</summary>
+        CoveredByAllies,
     }
 
     /// <summary>
@@ -41,6 +43,8 @@ namespace BDArmory.Control
         GuardScan = 0,
         ParallelSalvo = 1,
         PointDefence = 2,
+        /// <summary>[Overdrive] Fleet defence: threats skipped because allied interceptors cover them (its own channel so it doesn't reset the point defence reason).</summary>
+        FleetCover = 3,
     }
 
     /// <summary>
@@ -244,6 +248,7 @@ namespace BDArmory.Control
             GuardFireBlock.NoRadarLock => "no radar lock",
             GuardFireBlock.NoThreats => "no incoming missiles",
             GuardFireBlock.NoInterceptor => "no interceptor can engage",
+            GuardFireBlock.CoveredByAllies => "incoming missile covered by allied interceptors",
             _ => reason.ToString()
         };
         #endregion
@@ -446,16 +451,24 @@ namespace BDArmory.Control
     /// </summary>
     public sealed class GuardFireReasonLog
     {
-        readonly GuardFireBlock[] lastReason = new GuardFireBlock[3];
-        readonly float[] lastTime = [float.NegativeInfinity, float.NegativeInfinity, float.NegativeInfinity];
-        readonly bool[] logged = new bool[3];
+        const int Channels = 4; // [Overdrive] GuardFireChannel values (FleetCover added).
+        readonly GuardFireBlock[] lastReason = new GuardFireBlock[Channels];
+        readonly float[] lastTime = [float.NegativeInfinity, float.NegativeInfinity, float.NegativeInfinity, float.NegativeInfinity];
+        readonly bool[] logged = new bool[Channels];
+
+        /// <summary>[Overdrive] Whether ShouldLog would log the reason for the channel now, without remembering it (so the caller only builds the log detail when it will be logged).</summary>
+        public bool WouldLog(GuardFireChannel channel, GuardFireBlock reason, float now, float repeatInterval = 5f)
+        {
+            int c = (int)channel;
+            if (c < 0 || c >= lastReason.Length) return false;
+            return !(logged[c] && lastReason[c] == reason && now - lastTime[c] < repeatInterval);
+        }
 
         /// <summary>Whether to log the reason for the channel now (and remember it if so).</summary>
         public bool ShouldLog(GuardFireChannel channel, GuardFireBlock reason, float now, float repeatInterval = 5f)
         {
+            if (!WouldLog(channel, reason, now, repeatInterval)) return false;
             int c = (int)channel;
-            if (c < 0 || c >= lastReason.Length) return false;
-            if (logged[c] && lastReason[c] == reason && now - lastTime[c] < repeatInterval) return false;
             logged[c] = true;
             lastReason[c] = reason;
             lastTime[c] = now;

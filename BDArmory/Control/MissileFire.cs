@@ -920,6 +920,12 @@ namespace BDArmory.Control
         Func<int, float> pdTargetTimeToImpact; // Cached delegates for GetMostUrgentPDMslTgt.
         Func<int, bool> pdTargetExcluded;
         float pdUrgencyNow;
+        // [Overdrive] Fleet defence (GUARD_FLEET_DEFENCE): point defence counts the team's interceptors at each threat (see FleetPointDefence), set up once per scan.
+        bool pdFleet; // Fleet defence applies to this scan.
+        int pdShipKey; // This vessel's key in the fleet tally.
+        readonly List<int> pdFriendlyTeams = new(); // Our team and its allies (fleet tally team indices).
+        TargetInfo pdCoveredTarget; // DEBUG_GUARD_FIRE: a threat skipped this scan only because allies cover it, and its counts.
+        int pdCoveredOwn, pdCoveredTeam, pdCoveredQuota;
 
         /// <summary>A key for an interceptor's weapon type (name and engagement range, as the weapon list groups them).</summary>
         static int InterceptorTypeKey(MissileBase missile) => missile.GetShortName().GetHashCode() * 31 + missile.engageRangeMax.GetHashCode();
@@ -3365,12 +3371,17 @@ namespace BDArmory.Control
             int missileKey = ml.GetInstanceID();
             int typeKey = pointDefence ? InterceptorTypeKey(ml) : 0;
             int targetKey = tgtInfo != null ? tgtInfo.GetInstanceID() : 0;
+            // [Overdrive] Fleet defence: claim the threat so allies deciding before our interceptor is in flight count it (released below if nothing launches; expires on its own otherwise).
+            int claimShip = 0, claimThreat = 0;
+            bool fleetClaim = false;
             // Pump the core routine directly (rather than via StartCoroutine) so that the timing is identical to before the split.
             var core = GuardMissileRoutineCore(tgtInfo, ml);
             try
             {
+                fleetClaim = pointDefence && BDArmorySettings.GUARD_FLEET_DEFENCE && FleetPointDefence.Claim(this, tgtInfo, out claimShip, out claimThreat); // Inside the try, so the launch flag is released whatever happens.
                 while (!GuardFiringSuperseded(routineId) && core.MoveNext())
                 {
+                    if (fleetClaim && guardLaunchCount != launchesBefore) { FleetPointDefence.MarkLaunched(claimShip, claimThreat); fleetClaim = false; } // [Overdrive] Left the rail.
                     yield return core.Current;
                     MarkGuardFiringProgress(routineId);
                 }
@@ -3378,6 +3389,11 @@ namespace BDArmory.Control
             finally // [Overdrive] Always release the launch flag (an exception in the routine used to leave it set, stopping all guard missile fire until the vessel was reloaded).
             {
                 (core as IDisposable)?.Dispose();
+                if (fleetClaim) // [Overdrive] Fleet defence: the claim never outlives the routine unresolved, so a failed launch never blocks the fleet.
+                {
+                    if (guardLaunchCount != launchesBefore) FleetPointDefence.MarkLaunched(claimShip, claimThreat);
+                    else FleetPointDefence.ReleaseClaim(claimShip, claimThreat);
+                }
                 if (pointDefence)
                 {
                     if (guardLaunchCount == launchesBefore)
@@ -11304,6 +11320,15 @@ namespace BDArmory.Control
                 float pdNow = Time.time;
                 interceptorAttempts.PruneIfDue(pdNow);
                 interceptorTypeAttempts.PruneIfDue(pdNow);
+                // [Overdrive] Fleet defence: count the team's interceptors and launch claims at each threat (one tally per physics frame shared by all weapon managers).
+                pdFleet = BDArmorySettings.GUARD_FLEET_DEFENCE && Team != null;
+                pdCoveredTarget = null;
+                if (pdFleet)
+                {
+                    FleetPointDefence.EnsureFresh();
+                    FleetPointDefence.FriendlyTeams(Team, pdFriendlyTeams);
+                    pdShipKey = FleetPointDefence.ShipKey(vessel);
+                }
                 int pdRecentlyFailed = 0; // [Overdrive] DEBUG_GUARD_FIRE
                 bool pdFired = false;
                 int skipIRindex = 0;
@@ -11337,11 +11362,13 @@ namespace BDArmory.Control
                         pdReachMax = Mathf.Max(pdReachMax, interceptor.GetEngagementRangeMax());
                     }
                 }
-                if (!(layered ? GetMostUrgentPDMslTgt(PDMslTgtsCount, pdNow) : GetNextPDMslTgt(MissileID, PDMslTgtsCount)))
+                bool pdHasTarget = layered ? GetMostUrgentPDMslTgt(PDMslTgtsCount, pdNow) : GetNextPDMslTgt(MissileID, PDMslTgtsCount);
+                if (BDArmorySettings.DEBUG_GUARD_FIRE) LogFleetCover(pdNow); // [Overdrive] Fleet defence: a threat left to the allies covering it.
+                if (!pdHasTarget)
                 {
                     if (BDArmorySettings.DEBUG_GUARD_FIRE) LogGuardFire(GuardFireChannel.PointDefence, GuardFireBlock.QuotaFull, layered
-                        ? $"{PDMslTgtsCount} incoming missiles: each has its interceptors (Missiles/Tgt {maxMissilesOnTarget}), is outside the reach of the interceptors left ({(pdReachMax < 0 ? "none" : $"{pdReachMin:F0}-{pdReachMax:F0}m")}) or was just found unengageable"
-                        : $"{PDMslTgtsCount} incoming missiles, each with {maxMissilesOnTarget} interceptors away or queued");
+                        ? $"{PDMslTgtsCount} incoming missiles: each has its interceptors (Missiles/Tgt {maxMissilesOnTarget}{(pdFleet ? ", counting allied ships" : "")}), is outside the reach of the interceptors left ({(pdReachMax < 0 ? "none" : $"{pdReachMin:F0}-{pdReachMax:F0}m")}) or was just found unengageable"
+                        : $"{PDMslTgtsCount} incoming missiles, each with {maxMissilesOnTarget} interceptors away or queued{(pdFleet ? " (counting allied ships)" : "")}");
                     return;
                 }
 
@@ -11755,12 +11782,42 @@ namespace BDArmory.Control
                 if (!LayeredDefence.InReach(Vector3.Distance(vessel.CoM, target.Vessel.CoM), pdReachMin, pdReachMax)) return true; // No interceptor that can still fire reaches it from here.
                 float shootShoot = BDArmorySettings.GUARD_SHOOT_SHOOT_TTI;
                 int quota = LayeredDefence.PerTargetQuota(Mathf.RoundToInt(maxMissilesOnTarget), shootShoot > 0f ? PDTargetTimeToImpact(target) : float.PositiveInfinity, shootShoot);
-                return GuardFireRules.TargetSaturated(GetMissilesAway(target).numAway, quota) || pdTargetSkips.IsBlocked(0, target.GetInstanceID(), pdUrgencyNow);
+                return GuardFireRules.TargetSaturated(PDInterceptorsAt(target, quota), quota) || pdTargetSkips.IsBlocked(0, target.GetInstanceID(), pdUrgencyNow); // [Overdrive] Team-wide count with fleet defence.
             };
             int next = LayeredDefence.MostUrgentIndex(Mathf.Min(tgtCount, PDMslTgts.Count), pdTargetTimeToImpact, pdTargetExcluded);
             if (next < 0) return false;
             MissileID = next;
             return true;
+        }
+
+        /// <summary>
+        /// [Overdrive] The interceptors point defence counts at an incoming missile against its quota: our own (missiles away + queued launches), plus with fleet defence
+        /// (GUARD_FLEET_DEFENCE) the allied interceptors in flight at it and the allied launch claims on it (FleetDefenceRules.TeamInterceptors).
+        /// The fleet lookups are skipped when our own already fill the quota. Uses the fleet state set up at the start of the scan (pdFleet, pdFriendlyTeams, pdShipKey).
+        /// </summary>
+        int PDInterceptorsAt(TargetInfo target, int quota)
+        {
+            int own = GetMissilesAway(target).numAway;
+            if (!pdFleet || target == null || GuardFireRules.TargetSaturated(own, quota)) return own;
+            int threat = FleetPointDefence.ThreatKey(target);
+            int team = FleetDefenceRules.TeamInterceptors(own, FleetPointDefence.AlliedInFlight(pdFriendlyTeams, threat, pdShipKey), FleetPointDefence.AlliedClaims(pdFriendlyTeams, threat, pdShipKey), true);
+            if (pdCoveredTarget == null && FleetDefenceRules.CoveredByAllies(own, team, quota))
+            {
+                pdCoveredTarget = target; // DEBUG_GUARD_FIRE (LogFleetCover).
+                pdCoveredOwn = own;
+                pdCoveredTeam = team;
+                pdCoveredQuota = quota;
+            }
+            return team;
+        }
+
+        /// <summary>[Overdrive] DEBUG_GUARD_FIRE: log a threat this scan left to the allied interceptors covering it, naming one of the allies (rate limited, its own channel).</summary>
+        void LogFleetCover(float now)
+        {
+            if (pdCoveredTarget == null || !guardFireLog.WouldLog(GuardFireChannel.FleetCover, GuardFireBlock.CoveredByAllies, now)) return; // Build the detail only when it will be logged.
+            var threatVessel = pdCoveredTarget.Vessel;
+            string ally = FleetPointDefence.CoveringShipName(pdFriendlyTeams, FleetPointDefence.ThreatKey(pdCoveredTarget), pdShipKey);
+            LogGuardFire(GuardFireChannel.FleetCover, GuardFireBlock.CoveredByAllies, $"skipping {(threatVessel != null ? threatVessel.vesselName : "an incoming missile")}: covered by {ally}; team interceptors {pdCoveredTeam} (ours {pdCoveredOwn}) vs quota {pdCoveredQuota}");
         }
 
         /// <summary>[Overdrive] Time for an incoming missile to reach us at its current closing speed (LayeredDefence.TimeToImpact).</summary>
@@ -11776,7 +11833,7 @@ namespace BDArmory.Control
         public bool GetNextPDMslTgt(int currIndex, int tgtCount)
         {
             // The first incoming missile at or after currIndex (wrapping round) without its Missiles/Tgt interceptors; false if they all have them.
-            pdTargetSaturated ??= i => GuardFireRules.TargetSaturated(GetMissilesAway(PDMslTgts[i]).numAway, Mathf.RoundToInt(maxMissilesOnTarget));
+            pdTargetSaturated ??= i => { int quota = Mathf.RoundToInt(maxMissilesOnTarget); return GuardFireRules.TargetSaturated(PDInterceptorsAt(PDMslTgts[i], quota), quota); }; // [Overdrive] Team-wide count with fleet defence.
             int next = GuardFireRules.NextUnsaturatedIndex(Mathf.Min(tgtCount, PDMslTgts.Count), currIndex, pdTargetSaturated);
             if (next < 0) return false;
             currIndex = next;

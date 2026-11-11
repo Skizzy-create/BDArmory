@@ -32,6 +32,7 @@ Conventions:
    | `fire authority hold` | Fire authority is set to Hold. |
    | `no incoming missiles` | Point defence has nothing to engage. |
    | `no interceptor can engage` | Point defence has no interceptor able to fire. |
+   | `incoming missile covered by allied interceptors` | Fleet defence (`FleetCover` channel): allied ships already cover that missile (section H). |
    | `firing` | A launch started. |
 
    The `(...)` part lists every state that can stop fire:
@@ -101,3 +102,33 @@ Settings in `settings.cfg` (`BDASettings` node):
 3. Set `GUARD_LAYERED_DEFENCE = False`, restart, and repeat. Expected: stock behaviour. With threats already close, the shortest-range type fires first. Note the difference for the report.
 4. Shoot-shoot: set `GUARD_SHOOT_SHOOT_TTI = 12`. Expected: missiles under 12 s from impact get two interceptors in flight at once. Others still get Missiles/Tgt.
 5. Long fights with 50+ incoming missiles: no frame-rate drop compared with the setting off. Layered defence adds one pass over the interceptors and one over the incoming missiles per point defence scan (every 0.1 s), with no allocations.
+
+## H. Fleet-wide point defence (several friendly ships, one interceptor per threat)
+
+Branch `overdrive-fleet-pd`. Before this change, every friendly ship counted only its own interceptors. When three ships saw the same incoming missile, each fired one at it. Now point defence counts the interceptors of the whole team: its own, the allied interceptors in flight at that missile, and allied launches that have started but not left the rail yet (a short "claim", 2.5 s at most). A threat gets a new interceptor only when the ones chasing it have missed or been destroyed.
+
+Setting in `settings.cfg` (`BDASettings` node), settings.cfg only with no UI:
+- `GUARD_FLEET_DEFENCE = True` is the default. `False` restores per-ship counting (the previous behaviour).
+
+Missiles/Tgt and `GUARD_SHOOT_SHOOT_TTI` now apply to the fleet as a whole. With Missiles/Tgt = 2, the fleet sends two interceptors per threat in total, not two per ship.
+
+New log line with `DEBUG_GUARD_FIRE` on (its own `FleetCover` channel, at most one line per ship every 5 s):
+
+`[BDArmory.MissileFire]: <ship> guard fire (FleetCover): not firing - incoming missile covered by allied interceptors (skipping <missile>: covered by <ally ship>; team interceptors <n> (ours <m>) vs quota <q>)`
+
+1. Set `DEBUG_GUARD_FIRE = True` (section A). Leave `GUARD_LAYERED_DEFENCE` at its default.
+2. Spawn 2 or 3 friendly ships on the same team, close together (within 2 km), each with interceptor missiles (`engageMissile` on) and radar on. Set Missiles/Tgt = 1 on all of them. Turn on guard mode.
+3. Spawn hostile craft that launch 10 or more anti-ship or cruise missiles at the group, so each incoming missile is seen by every friendly ship.
+4. Expected with `GUARD_FLEET_DEFENCE = True`:
+   1. Each incoming missile gets one interceptor across the whole fleet. Count the `guard fire (PointDefence): firing - ... at <missile>` lines per missile name across all ships: one each while the interceptor is chasing.
+   2. The other ships log `guard fire (FleetCover): ... skipping <missile>: covered by <ally ship>` and engage other incoming missiles instead.
+   3. A missile gets a second interceptor only after the first one misses or is destroyed. Look for a new `firing` line at that missile within about 0.1 to 0.5 s of the miss, from any ship.
+   4. If one ship's launch fails (log: `point defence: <interceptor> didn't launch at <missile>`), another ship fires at that missile straight away. It must not wait 2.5 s.
+   5. Two ships never fire at the same missile in the same instant (same-frame race). An occasional double launch at one missile is a failure. Note the missile name and the two ships.
+   6. Total interceptors fired should be roughly the number of incoming missiles plus misses, not ships x missiles.
+5. Missiles/Tgt = 2 on all ships: each incoming missile gets two interceptors in total across the fleet.
+6. Retargeting: with `MISSILE_RETARGETING = True`, when an interceptor's target dies and it switches to another incoming missile, that missile counts as covered. Ships should not fire an extra interceptor at it.
+7. Comparison: quit, set `GUARD_FLEET_DEFENCE = False`, restart and repeat step 3 with the same craft. Expected: the previous behaviour. Each ship fires its own interceptor at each missile it sees (up to 3 per missile with 3 ships), and there are no `FleetCover` lines. For the report, write down the interceptor totals for both runs.
+8. Two teams: put one friendly ship on team A and one on team B (not allied), both engaging the same incoming missiles. Each team fires its own interceptor. Fleet defence never counts another team's interceptors.
+9. Performance: 20+ ships and 50+ incoming missiles, compared with the setting off. There should be no frame-rate drop. The team-wide tally is rebuilt at most once per physics frame (one pass over the fired missiles, shared by all ships), and each point defence scan adds a few dictionary lookups per incoming missile, with no allocations.
+10. After the fight, search the log for `Exception`. Then check that guard mode keeps firing: launch a second wave of missiles and expect the same behaviour as in step 4.
