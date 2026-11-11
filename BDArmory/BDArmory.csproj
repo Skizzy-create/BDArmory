@@ -158,6 +158,7 @@
     <Compile Include="Control\BDModuleVTOLAI.cs" />
     <Compile Include="Control\IBDAIControl.cs" />
     <Compile Include="Control\FireAuthority.cs" />
+    <Compile Include="Control\GuardFireLogic.cs" />
     <Compile Include="Control\MissileFire.cs" />
     <Compile Include="Control\ModuleWingCommander.cs" />
     <Compile Include="CounterMeasure\CMBubble.cs" />

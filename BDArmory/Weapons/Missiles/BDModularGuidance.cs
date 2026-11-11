@@ -1306,10 +1306,12 @@ namespace BDArmory.Weapons.Missiles
             DetonationDistanceState = DetonationDistanceStates.Cruising;
             BDATargetManager.FiredMissiles.Remove(this);
             MissileState = MissileStates.Idle;
-            if (FiredByWM != null && FiredByWM.guardFiringMissile)
+            // Disable target lock. [Overdrive] Doesn't release a launch routine's ownership of the flag.
+            var ownWM = WeaponManager;
+            if (ownWM != null && ownWM.vessel == vessel && ownWM.guardFiringMissile)
             {
                 if (BDArmorySettings.DEBUG_MISSILES) Debug.Log($"[BDArmory.BDModularGuidance]: disabling target lock for {vessel.vesselName}");
-                FiredByWM.guardFiringMissile = false; // Disable target lock.
+                ownWM.ReleaseModularGuidanceHold();
             }
         }
 
@@ -1347,10 +1349,15 @@ namespace BDArmory.Weapons.Missiles
             debugString.Length = 0;
             if (guidanceActive && MissileReferenceTransform != null && _velocityTransform != null)
             {
-                if (FiredByWM != null && !FiredByWM.guardFiringMissile)
+                // Enable target lock on the missile's own weapon manager, so it doesn't re-target mid-flight (upstream intent).
+                // [Overdrive] Only a WM on the missile vessel itself: FiredByWM is usually the launching ship's WM (taken while still attached),
+                // and holding that one froze the ship's whole guard mode (scans, launches, point defence) until the missile died.
+                // Refreshed every frame while guiding; the weapon manager releases it once the missile stops refreshing it.
+                var ownWM = WeaponManager;
+                if (ownWM != null && ownWM.vessel == vessel)
                 {
-                    if (BDArmorySettings.DEBUG_MISSILES) Debug.Log($"[BDArmory.BDModularGuidance]: enabling target lock for {vessel.vesselName}");
-                    FiredByWM.guardFiringMissile = true; // Enable target lock.
+                    if (BDArmorySettings.DEBUG_MISSILES && !ownWM.guardFiringMissile) Debug.Log($"[BDArmory.BDModularGuidance]: enabling target lock for {vessel.vesselName}");
+                    ownWM.HoldGuardFiringForModularGuidance();
                 }
 
                 if (vessel.Velocity().magnitude < MinSpeedGuidance)

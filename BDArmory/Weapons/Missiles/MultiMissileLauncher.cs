@@ -68,6 +68,25 @@ namespace BDArmory.Weapons.Missiles
         [KSPField(isPersistant = true)] float attachedMissileDiameter = 0;
         MissileFire FiredByWM = null; // Assigned when fired and then not updated even if the parent craft changes their primary WM.
         private int tubesFired = 0;
+        int nextSalvoSize = 0; // [Overdrive] One-shot salvo size for the next salvo (guard mode parallel salvo), all at the launcher's target. 0: use salvoSize.
+
+        /// <summary>
+        /// [Overdrive] Fire this many missiles in the next salvo instead of salvoSize, all at the launcher's own target (no spreading over the weapon manager's other targets).
+        /// Used by the guard mode parallel salvo so a single launcher (e.g. one VLS) can fire the whole salvo for a target. Consumed when the salvo starts; 0 clears it.
+        /// </summary>
+        public void SetNextSalvoSize(int count) => nextSalvoSize = Mathf.Max(0, count);
+
+        /// <summary>[Overdrive] Loaded tubes that can fire before the launcher needs a reload (limited by ammo).</summary>
+        public int ReadyTubes
+        {
+            get
+            {
+                if (launchTransforms == null) return 0;
+                int tubes = Mathf.Max(0, launchTransforms.Length - tubesFired);
+                if (BDArmorySettings.INFINITE_ORDINANCE || missileSpawner == null) return tubes;
+                return Mathf.Min(tubes, Mathf.Max(0, missileSpawner.ammoCount));
+            }
+        }
         [KSPField(isPersistant = true)]
         private bool LoadoutModified = false;
         public BDTeam Team = null;
@@ -854,6 +873,9 @@ namespace BDArmory.Weapons.Missiles
         IEnumerator salvoFire(bool LaunchThenDestroy)
         {
             int launchesThisSalvo = 0;
+            bool concentrate = nextSalvoSize > 0; // [Overdrive] A one-shot salvo size from the parallel salvo: fire that many, all at the launcher's target.
+            int salvoCount = concentrate ? nextSalvoSize : (int)salvoSize;
+            nextSalvoSize = 0;
             float timeGap = (60 / rippleRPM) * TimeWarp.CurrentRate;
             int TargetID = 0;
             bool missileRegistry = true;
@@ -901,7 +923,7 @@ namespace BDArmory.Weapons.Missiles
                     salvoLaunching = false;
                     yield break;
                 } // Died while waiting.
-                if (launchesThisSalvo >= (int)salvoSize) //catch if launcher is trying to launch more missiles than it has
+                if (launchesThisSalvo >= salvoCount) //catch if launcher is trying to launch more missiles than it has
                 {
                     //if (BDArmorySettings.DEBUG_MISSILES) Debug.Log("[BDArmory.MultiMissileLauncher]: oops! firing more missiles than tubes or ammo");
                     break;
@@ -1085,7 +1107,7 @@ namespace BDArmory.Weapons.Missiles
                     if (ml.TargetingMode == TargetingModes.Heat || ml.TargetingMode == TargetingModes.Radar || ml.TargetingMode == TargetingModes.Gps || ml.TargetingMode == TargetingModes.Inertial)
                     {
                         //Debug.Log($"[BDArmory.MultiMissileLauncherDebug]: Beginning target distribution; Num of targets: {targetsAssigned.Count - 1}; wpm targets: {wpm.targetsAssigned.Count}");
-                        if (targetsAssigned.Count > 0 && salvoSize > 1)
+                        if (!concentrate && targetsAssigned.Count > 0 && salvoSize > 1)
                         {
                             // The number of targets this salvo may be spread over.
                             // (Was 'Min(targetsAssigned.Count - 1, multiMissileTgtNum)' as an exclusive bound, which never considered the last target on the list, and was inconsistent with the wrap check.)
@@ -1381,7 +1403,7 @@ namespace BDArmory.Weapons.Missiles
             }
             else
             {
-                if ((int)salvoSize < launchTransforms.Length && missileLauncher.reloadRoutine == null && (BDArmorySettings.INFINITE_ORDINANCE || missileSpawner.ammoCount > 0))
+                if (salvoCount < launchTransforms.Length && missileLauncher.reloadRoutine == null && (BDArmorySettings.INFINITE_ORDINANCE || missileSpawner.ammoCount > 0))
                 {
                     if (launcherCooldown > 0)
                     {

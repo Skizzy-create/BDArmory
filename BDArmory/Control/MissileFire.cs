@@ -71,6 +71,7 @@ namespace BDArmory.Control
         int pointDefenseIRMissileCount = -1;
         float pointDefenseMissileMaxARH = -1f;
         float pointDefenseMissileMaxRange = -1f;
+        float pdReachMin = 0f, pdReachMax = -1f; // [Overdrive] Layered defence: the reach of the unfired interceptors this scan (threats outside it are skipped).
         bool pointDefenseMissileHasInertial = false;
         bool pointDefenseMissileHasLaser = false;
         bool pointDefenseMissileHasRadar = false;
@@ -907,6 +908,99 @@ namespace BDArmory.Control
         public bool debilitated = false;
 
         public bool guardFiringMissile;
+        #region Overdrive: launch flag ownership, interceptor retries, guard fire diagnostics
+        // guardFiringMissile blocks target scans, point defence and new launch routines. It used to be released only at the end of a launch routine,
+        // so an exception in a routine, or a guided modular missile (which sets it every frame and never cleared it), stopped all guard missile fire for good.
+        readonly GuardFiringFlag guardFiring = new(); // Who owns guardFiringMissile: a launch routine (and when it last made progress) or a guided modular missile's hold.
+        int guardLaunchCount = 0; // Real launches by FireCurrentMissile / FireParallelMissile (missiles that left the rail).
+        readonly InterceptorAttemptMemory interceptorAttempts = new(); // Point defence interceptors (instances) that failed to launch at a target.
+        readonly InterceptorAttemptMemory interceptorTypeAttempts = new(); // Point defence interceptor types that failed to launch at a target (so the other types get a turn).
+        Func<int, bool> pdTargetSaturated; // Cached delegate for GetNextPDMslTgt (no per-call allocation).
+        readonly InterceptorAttemptMemory pdTargetSkips = new(); // [Overdrive] Layered defence: incoming missiles no interceptor could engage last scan (skipped briefly so the next most urgent gets a turn).
+        Func<int, float> pdTargetTimeToImpact; // Cached delegates for GetMostUrgentPDMslTgt.
+        Func<int, bool> pdTargetExcluded;
+        float pdUrgencyNow;
+
+        /// <summary>A key for an interceptor's weapon type (name and engagement range, as the weapon list groups them).</summary>
+        static int InterceptorTypeKey(MissileBase missile) => missile.GetShortName().GetHashCode() * 31 + missile.engageRangeMax.GetHashCode();
+        readonly GuardFireReasonLog guardFireLog = new(); // Rate limiting for DEBUG_GUARD_FIRE.
+
+        /// <summary>Take the launch flag for a launch routine. False if it's held (another routine, or a guided modular missile).</summary>
+        bool TryBeginGuardFiring(out int routineId) => guardFiring.TryBegin(ref guardFiringMissile, Time.time, out routineId);
+
+        /// <summary>The routine was released by the watchdog (it should stop).</summary>
+        bool GuardFiringSuperseded(int routineId) => guardFiring.Superseded(routineId);
+
+        void MarkGuardFiringProgress(int routineId) => guardFiring.MarkProgress(routineId, Time.time);
+
+        /// <summary>Release the launch flag at the end of a launch routine (always, via finally), unless the watchdog already released it.</summary>
+        void EndGuardFiring(int routineId)
+        {
+            if (!guardFiring.End(ref guardFiringMissile, routineId)) return; // Released by the watchdog; another routine may own the flag now.
+            currFiringTarget = null;
+            currFiringMissile = null;
+        }
+
+        /// <summary>
+        /// Called every frame by guided modular missiles fired by this weapon manager (BDModularGuidance.GuidanceSteer).
+        /// Keeps the upstream behaviour of holding guardFiringMissile while the missile guides, but the hold lapses once the missile stops refreshing it.
+        /// </summary>
+        public void HoldGuardFiringForModularGuidance() => guardFiring.Hold(ref guardFiringMissile, Time.time);
+
+        /// <summary>Release a modular missile's hold on guardFiringMissile (BDModularGuidance.ResetMissile). A launch routine's ownership is kept.</summary>
+        public void ReleaseModularGuidanceHold() => guardFiring.ReleaseHold(ref guardFiringMissile);
+
+        /// <summary>
+        /// Release guardFiringMissile if its owning routine has stalled (stopped without its clean-up) or if it was set outside a routine and the modular guidance hold has lapsed.
+        /// </summary>
+        void CheckGuardFiringFlag()
+        {
+            if (!guardFiringMissile) return;
+            float now = Time.time;
+            float lastProgress = guardFiring.LastProgress;
+            switch (guardFiring.Check(ref guardFiringMissile, now, GuardFireRules.StallTimeout(targetScanInterval)))
+            {
+                case GuardFiringFlagAction.ReleaseStalledRoutine: // The stalled routine stops (or no longer touches the flag) if it ever resumes.
+                    Debug.LogWarning($"[BDArmory.MissileFire]: {vessel.vesselName}'s missile launch routine made no progress for {now - lastProgress:F1}s, releasing the launch flag.");
+                    currFiringTarget = null;
+                    currFiringMissile = null;
+                    break;
+                case GuardFiringFlagAction.ReleaseExpiredHold:
+                    if (BDArmorySettings.DEBUG_MISSILES || BDArmorySettings.DEBUG_GUARD_FIRE) Debug.Log($"[BDArmory.MissileFire]: {vessel.vesselName} releasing the launch flag held outside a launch routine (modular missile guidance ended, or set by other code).");
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// [DEBUG_GUARD_FIRE] Log why guard mode isn't firing (rate limited per path: when the reason changes or every 5s).
+        /// </summary>
+        void LogGuardFire(GuardFireChannel channel, GuardFireBlock reason, string detail = null)
+        {
+            if (!BDArmorySettings.DEBUG_GUARD_FIRE) return;
+            if (!guardFireLog.ShouldLog(channel, reason, Time.time)) return;
+            Debug.Log($"[BDArmory.MissileFire]: {vessel.vesselName} guard fire ({channel}): {(reason == GuardFireBlock.None ? "" : "not firing - ")}{GuardFireRules.Describe(reason)}{(string.IsNullOrEmpty(detail) ? "" : $" ({detail})")}");
+        }
+
+        /// <summary>
+        /// [DEBUG_GUARD_FIRE] The states that can stop guard missile fire, for the log: the launch flag and its owner, the quotas, the weapon selection, radar locks, fire authority and override.
+        /// </summary>
+        string GuardFireStateDetail()
+        {
+            float now = Time.time;
+            string flag;
+            if (!guardFiringMissile) flag = "free";
+            else if (guardFiring.RoutineActive)
+                flag = $"held by a launch routine ({(currFiringMissile != null ? currFiringMissile.shortName : "no missile")} at {(currFiringTarget != null && currFiringTarget.Vessel != null ? currFiringTarget.Vessel.vesselName : "no target")}, last progress {now - guardFiring.LastProgress:F1}s ago)";
+            else flag = guardFiring.HoldUntil > now ? "held by a guided modular missile" : "held outside a launch routine (released next frame)";
+            var target = currentTarget;
+            int queued = target != null && queuedLaunches.TryGetValue(target, out int[] q) ? q[0] : 0;
+            int lockCapacity = vesselRadarData ? EffectiveMaxRadarLocks + vesselRadarData.MaxRadarLocksExternal : 0;
+            int locks = vesselRadarData ? vesselRadarData.numLockedTargets : 0;
+            return $"launch flag {flag}; target {(target != null && target.Vessel != null ? target.Vessel.vesselName : "none")}: missiles/target {firedMissiles}/{maxMissilesOnTarget} (queued {queued}); engaged targets {engagedTargets}/{multiMissileTgtNum}"
+                + $"; weapon {(selectedWeapon != null ? selectedWeapon.GetShortName() : "none")}, ready missile {(CurrentMissile != null ? CurrentMissile.shortName + (CurrentMissile.launched ? " (fired, no unfired one of this type)" : "") : "none")}"
+                + $"; radar locks {locks}/{lockCapacity}; fire authority {fireAuthority}; external override {(externalOverride ? "on" : "off")}; incoming missiles {PDMslTgts.Count}; interceptor failures remembered {interceptorAttempts.Count}";
+        }
+        #endregion
         public bool hasAntiRadiationOrdnance;
         public int antiradTargets;
         public bool antiRadTargetAcquired;
@@ -2553,7 +2647,7 @@ namespace BDArmory.Control
 
         private void ClearQueuedLaunches()
         {
-            if (queuedLaunchesRequireClearing && Time.time - queuedLaunchesTimeSinceLastAddition > 20f) // Was 'last - now > 20', which is never true, so stale queued launches were never cleared.
+            if (GuardFireRules.QueuedLaunchesStale(queuedLaunchesRequireClearing, Time.time, queuedLaunchesTimeSinceLastAddition)) // Was 'last - now > 20', which is never true, so stale queued launches were never cleared.
             {
                 queuedLaunches.Clear();
                 queuedLaunchesRequireClearing = false;
@@ -2641,7 +2735,7 @@ namespace BDArmory.Control
                             continue;
                     }
                     //if (missileBase.MissileState != MissileBase.MissileStates.PostThrust && !missileBase.HasMissed && !missileBase.HasExploded)
-                    if ((missileBase.HasFired || missileBase.launched) && !missileBase.HasExploded && (!missileBase.HasMissed || missileBase.GetWeaponClass() == WeaponClasses.Bomb)) //culling post-thrust missiles makes AGMs get cleared almost immediately after launch
+                    if (GuardFireRules.CountsAsMissileAway(true, missileBase.HasFired, missileBase.launched, missileBase.HasExploded, missileBase.HasMissed, missileBase.GetWeaponClass() == WeaponClasses.Bomb)) //culling post-thrust missiles makes AGMs get cleared almost immediately after launch
                     {
                         bool activeSARH = (missileBase.TargetingMode == MissileBase.TargetingModes.Radar && !missileBase.ActiveRadar) || (missileBase.TargetingMode == MissileBase.TargetingModes.Gps && missileBase.gpsUpdates >= 0);
                         if (missilesAway.TryGetValue(missileBase.targetVessel, out int[] tempArr))
@@ -2667,11 +2761,12 @@ namespace BDArmory.Control
             }
             if (!BDATargetManager.FiredMissiles.Contains(PreviousMissile)) PreviousMissile = null;
             // Count the targets that have our own missiles away or queued (MML salvos / reloadable rails in progress). Missiles fired by others that we're guiding don't count.
+            // [Overdrive] Nor do incoming missiles chased by our interceptors (GuardFireRules.CountsAsEngagedTarget): with Max Missile Tgts 1, one interceptor in flight stopped all missile fire at vessels.
             int engaged = 0;
             foreach (var kvp in missilesAway)
-                if (kvp.Value[0] > 0) ++engaged;
+                if (GuardFireRules.CountsAsEngagedTarget(kvp.Key.isMissile, kvp.Value[0])) ++engaged;
             foreach (var kvp in queuedLaunches)
-                if (kvp.Value[0] > 0 && kvp.Key != null && !(missilesAway.TryGetValue(kvp.Key, out int[] away) && away[0] > 0)) ++engaged;
+                if (kvp.Key != null && GuardFireRules.CountsAsEngagedTarget(kvp.Key.isMissile, kvp.Value[0]) && !(missilesAway.TryGetValue(kvp.Key, out int[] away) && away[0] > 0)) ++engaged;
             engagedTargets = engaged;
             //this.missilesAway = tempMissilesAway;
         }
@@ -2738,6 +2833,7 @@ namespace BDArmory.Control
                 return; // Don't do anything else if we're not in control.
             }
             if (weaponsListNeedsUpdating) UpdateList();
+            CheckGuardFiringFlag(); // [Overdrive] Never leave the launch flag stuck (stalled routine, ended modular missile guidance).
 
             if (!vessel.packed)
             {
@@ -3257,17 +3353,43 @@ namespace BDArmory.Control
         MissileBase currFiringMissile = null;
         TargetInfo currFiringTarget = null;
 
-        IEnumerator GuardMissileRoutine(TargetInfo tgtInfo, MissileBase ml)
+        IEnumerator GuardMissileRoutine(TargetInfo tgtInfo, MissileBase ml, bool pointDefence = false)
         {
-            if (ml && !guardFiringMissile)
+            if (!ml || !TryBeginGuardFiring(out int routineId)) yield break;
+            // [Overdrive] Point defence remembers interceptors that ran the launch routine without launching, so it tries the others next (see InterceptorAttemptMemory).
+            int launchesBefore = guardLaunchCount;
+            int missileKey = ml.GetInstanceID();
+            int typeKey = pointDefence ? InterceptorTypeKey(ml) : 0;
+            int targetKey = tgtInfo != null ? tgtInfo.GetInstanceID() : 0;
+            // Pump the core routine directly (rather than via StartCoroutine) so that the timing is identical to before the split.
+            var core = GuardMissileRoutineCore(tgtInfo, ml);
+            try
             {
-                guardFiringMissile = true;
-                // Pump the core routine directly (rather than via StartCoroutine) so that the timing is identical to before the split.
-                var core = GuardMissileRoutineCore(tgtInfo, ml);
-                while (core.MoveNext()) yield return core.Current;
-                guardFiringMissile = false;
-                currFiringTarget = null;
-                currFiringMissile = null;
+                while (!GuardFiringSuperseded(routineId) && core.MoveNext())
+                {
+                    yield return core.Current;
+                    MarkGuardFiringProgress(routineId);
+                }
+            }
+            finally // [Overdrive] Always release the launch flag (an exception in the routine used to leave it set, stopping all guard missile fire until the vessel was reloaded).
+            {
+                (core as IDisposable)?.Dispose();
+                if (pointDefence)
+                {
+                    if (guardLaunchCount == launchesBefore)
+                    {
+                        // Nothing left the rail: skip this interceptor for longer, and its type briefly, at this target, so point defence tries the others instead of picking it again every scan.
+                        interceptorAttempts.RecordFailure(missileKey, targetKey, Time.time, GuardFireRules.InterceptorInstanceRetryCooldown);
+                        interceptorTypeAttempts.RecordFailure(typeKey, targetKey, Time.time, GuardFireRules.InterceptorRetryCooldown);
+                        if (BDArmorySettings.DEBUG_GUARD_FIRE || BDArmorySettings.DEBUG_APS) Debug.Log($"[BDArmory.MissileFire]: {(vessel != null ? vessel.vesselName : "null")} point defence: {(ml != null ? ml.shortName : "interceptor")} didn't launch at {(tgtInfo != null && tgtInfo.Vessel != null ? tgtInfo.Vessel.vesselName : "its target")}, trying other interceptors first.");
+                    }
+                    else
+                    {
+                        interceptorAttempts.Forget(missileKey, targetKey);
+                        interceptorTypeAttempts.Forget(typeKey, targetKey);
+                    }
+                }
+                EndGuardFiring(routineId);
             }
         }
 
@@ -4124,8 +4246,9 @@ namespace BDArmory.Control
         IEnumerator GuardBombRoutine()
         {
             string guardTargetName = guardTarget.GetName();
+            if (CurrentMissile == null) yield break; // [Overdrive] The set-up below runs before the try/finally: don't take the launch flag only to throw and leave it to the watchdog.
+            if (!TryBeginGuardFiring(out int bombRoutineId)) yield break; // [Overdrive] Launch flag ownership (released in the finally below, or by the watchdog).
             if (BDArmorySettings.DEBUG_AI) Debug.Log($"[BDArmory.MissileFire]: Starting guard bomb routine with {CurrentMissile.shortName} against {guardTargetName}. Fired missiles: {firedMissiles} / {maxMissilesOnTarget}");
-            guardFiringMissile = true;
             float radius = CurrentMissile.GetBlastRadius() * Mathf.Max(0.68f * CurrentMissile.clusterbomb, 1f) * Mathf.Min(0.68f + 1.4f * (maxMissilesOnTarget - 1f), 1.5f);
             radius = Mathf.Min(radius, 150f);
             float targetToleranceSqr = Mathf.Max(100, 0.013f * (float)guardTarget.srfSpeed * (float)guardTarget.srfSpeed);
@@ -4141,8 +4264,9 @@ namespace BDArmory.Control
 
             try
             {
-                while (guardTarget && weaponIndex > 0 && weaponArray[weaponIndex].GetWeaponClass() == WeaponClasses.Bomb && firedMissiles < maxMissilesOnTarget)
+                while (guardTarget && weaponIndex > 0 && weaponArray[weaponIndex].GetWeaponClass() == WeaponClasses.Bomb && firedMissiles < maxMissilesOnTarget && !GuardFiringSuperseded(bombRoutineId))
                 {
+                    MarkGuardFiringProgress(bombRoutineId);
                     BDModulePilotAI pilotAI = null;
                     BDModuleVTOLAI vtolAI = null;
                     var ai = AI;
@@ -4354,7 +4478,7 @@ namespace BDArmory.Control
                 bombAimerOvershoot = 0;
                 bombAimerLateralError = 0;
                 designatedGPSInfo = new GPSTargetInfo();
-                guardFiringMissile = false;
+                EndGuardFiring(bombRoutineId);
                 bombAimerTrajectoryAtTimeFired.Clear();
                 if (BDArmorySettings.DEBUG_AI) Debug.Log($"[BDArmory.MissileFire]: Ending guard bomb routine against {guardTargetName}.");
             }
@@ -4907,6 +5031,7 @@ namespace BDArmory.Control
 
         void RaiseOnMissileFired(MissileBase missile, Vessel targetVessel)
         {
+            ++guardLaunchCount; // [Overdrive] Real launches only (point defence uses this to tell whether an interceptor's launch routine fired).
             if (OnMissileFired == null) return;
             try { OnMissileFired(this, missile, targetVessel); }
             catch (Exception e) { Debug.LogError($"[BDArmory.MissileFire]: OnMissileFired handler threw: {e}"); }
@@ -5416,7 +5541,7 @@ namespace BDArmory.Control
             if (selectedWeapon != null && (selectedWeapon.GetWeaponClass() == WeaponClasses.Bomb || selectedWeapon.GetWeaponClass() == WeaponClasses.Missile || selectedWeapon.GetWeaponClass() == WeaponClasses.SLW))
             {
                 //Debug.Log("[BDArmory.MissileFire]: =====selected weapon: " + selectedWeapon.GetPart().name);
-                if (!CurrentMissile || CurrentMissile.GetPartName() != selectedWeapon.GetPartName() || CurrentMissile.engageRangeMax != selectedWeaponsEngageRangeMax || CurrentMissile.missileFireAngle != selectedWeaponsMissileFOV || CurrentMissile.vessel != vessel)
+                if (!CurrentMissile || CurrentMissile.launched || CurrentMissile.GetPartName() != selectedWeapon.GetPartName() || CurrentMissile.engageRangeMax != selectedWeaponsEngageRangeMax || CurrentMissile.missileFireAngle != selectedWeaponsMissileFOV || CurrentMissile.vessel != vessel) // [Overdrive] Also look for an unfired missile when the current one has fired (launchers that stay on the vessel: VLS cells, multi-launchers, reloadable rails).
                 {
                     using var Missile = VesselModuleRegistry.GetModules<MissileBase>(vessel).GetEnumerator();
                     while (Missile.MoveNext())
@@ -6225,23 +6350,23 @@ namespace BDArmory.Control
                         antiRadiationTarget = Vector3.zero;
                     }
                 }
-                int vesselTargets = 0, saturatedVesselTargets = 0;
+                int vesselTargets = 0, saturatedVesselTargets = 0, missileTargets = 0, saturatedMissileTargets = 0;
                 using (List<TargetInfo>.Enumerator target = BDATargetManager.TargetList(Team).GetEnumerator())
                 {
                     while (target.MoveNext())
                     {
                         if (target.Current == null) continue;
                         bool isVesselTarget = !target.Current.isMissile;
-                        if (isVesselTarget) ++vesselTargets;
+                        if (isVesselTarget) ++vesselTargets; else ++missileTargets;
                         if (GetMissilesAway(target.Current).numAway >= maxMissilesOnTarget)
                         {
                             missileSaturatedTargets.Add(target.Current);
-                            if (isVesselTarget) ++saturatedVesselTargets;
+                            if (isVesselTarget) ++saturatedVesselTargets; else ++saturatedMissileTargets;
                             if (BDArmorySettings.DEBUG_MISSILES) Debug.Log($"[BDArmory.MissileFire]: {vessel.GetName()} Adding {(target.Current.Vessel != null ? target.Current.Vessel.GetName() : "null")} to exclusion list; length: {missileSaturatedTargets.Count}");
                         }
                     }
                 }
-                if (saturatedVesselTargets >= vesselTargets) //oops, already fired missiles at all available targets
+                if (GuardFireRules.ResetSaturatedExclusions(vesselTargets, saturatedVesselTargets, missileTargets, saturatedMissileTargets)) //oops, already fired missiles at all available targets ([Overdrive] with only missiles left, keep skipping the saturated ones while some missile has room)
                 {
                     if (BDArmorySettings.DEBUG_MISSILES) Debug.Log("[BDArmory.MissileFire]: max targets fired on, resetting target list!");
                     missileSaturatedTargets.Clear(); //clear targets tried, so AI can track best current target until such time as it can fire again
@@ -8530,7 +8655,7 @@ namespace BDArmory.Control
                                         if (msl.Current == null) continue;
                                         if (msl.Current.GetWeaponChannel() > weaponChannel) continue;
                                         if (msl.Current.launched) continue;
-                                        if (msl.Current.GetShortName() == ml.GetShortName()) continue;
+                                        if (msl.Current.GetShortName() != ml.GetShortName()) continue; // [Overdrive] Another unfired missile of the *same* type (was '==', so an empty type passed whenever any other type had missiles left, and kept being selected with nothing to fire). See GuardFireRules.MissileTypeReady.
                                         readyMissiles = true;
                                         break;
                                     }
@@ -9672,8 +9797,25 @@ namespace BDArmory.Control
         /// </summary>
         IEnumerator GuardParallelSalvoRoutine()
         {
-            if (guardFiringMissile) yield break;
-            guardFiringMissile = true;
+            if (!TryBeginGuardFiring(out int routineId)) yield break; // [Overdrive] Launch flag ownership (released in the finally below, or by the watchdog).
+            var body = GuardParallelSalvoBody();
+            try
+            {
+                while (!GuardFiringSuperseded(routineId) && body.MoveNext())
+                {
+                    yield return body.Current;
+                    MarkGuardFiringProgress(routineId);
+                }
+            }
+            finally
+            {
+                (body as IDisposable)?.Dispose(); // Runs the body's clean-up if it was cut short.
+                EndGuardFiring(routineId);
+            }
+        }
+
+        IEnumerator GuardParallelSalvoBody()
+        {
             int launchesThisSalvo = 0;
             var primarySelection = SnapshotWeaponSelection();
             TargetInfo primaryTarget = currentTarget;
@@ -9696,15 +9838,16 @@ namespace BDArmory.Control
                 int locksUsed = vesselRadarData ? vesselRadarData.numLockedTargets : 0;
                 bool waitForRadarLocks = false;
                 int picksThisFrame = 0;
+                int skippedSaturated = 0, skippedMaxEngaged = 0, skippedNoWeapon = 0, skippedNotAuthorized = 0, skippedNoLock = 0; // [Overdrive] DEBUG_GUARD_FIRE
 
                 for (int i = 0; i < parallelTargets.Count; ++i)
                 {
                     var target = parallelTargets[i];
                     if (!ParallelTargetValid(target)) continue;
                     int away = GetMissilesAway(target).numAway;
-                    if (away >= maxPerTarget) continue; // Saturated.
+                    if (away >= maxPerTarget) { ++skippedSaturated; continue; } // Saturated.
                     bool newTarget = away <= 0;
-                    if (newTarget && engaged >= maxEngaged) continue; // Already engaging the max number of targets.
+                    if (newTarget && engaged >= maxEngaged) { ++skippedMaxEngaged; continue; } // Already engaging the max number of targets.
 
                     MissileBase prototype;
                     bool unguided;
@@ -9739,8 +9882,8 @@ namespace BDArmory.Control
                         if (prototype == null || prototype.launched || prototype.HasFired) prototype = FindParallelPrototype(selectedWeapon.GetShortName(), selectedWeapon.GetEngageRange(), selectedWeapon.GetEngageFOV());
                         unguided = unguidedWeapon;
                     }
-                    if (prototype == null) continue;
-                    if (!GuardMissileLaunchAuthorized(target, prototype, unguided)) continue;
+                    if (prototype == null) { ++skippedNoWeapon; continue; }
+                    if (!GuardMissileLaunchAuthorized(target, prototype, unguided)) { ++skippedNotAuthorized; continue; }
 
                     // Radar locks: SARH missiles need a lock on their target, GPS missiles can get coordinates from one and uncaged heat seekers are pointed at the target with one.
                     // Check the lock capacity first so that new locks don't replace locks that are guiding missiles.
@@ -9766,6 +9909,7 @@ namespace BDArmory.Control
                     if (!unguided && prototype.TargetingMode == MissileBase.TargetingModes.Radar && !locked && !ParallelActiveSeekerCanAcquire(prototype, targetVessel))
                     {
                         if (BDArmorySettings.DEBUG_MISSILES) Debug.Log($"[BDArmory.MissileFire]: {vessel.vesselName} parallel salvo: no radar lock available for {targetVessel.vesselName}, skipping.");
+                        ++skippedNoLock;
                         continue; // No lock slot for the SARH missile and the target isn't within active seeker range.
                     }
 
@@ -9777,12 +9921,20 @@ namespace BDArmory.Control
                         engageRange = prototype.GetEngageRange(),
                         engageFOV = prototype.GetEngageFOV(),
                         unguided = unguided,
-                        slots = Mathf.Min(salvoSize, maxPerTarget - Mathf.Max(away, 0))
+                        slots = GuardFireRules.SalvoSlots(away, salvoSize, maxPerTarget)
                     });
                     if (newTarget) ++engaged;
                 }
                 RestoreWeaponSelection(primarySelection);
-                if (parallelPlans.Count == 0) yield break;
+                if (parallelPlans.Count == 0)
+                {
+                    if (BDArmorySettings.DEBUG_GUARD_FIRE)
+                    {
+                        var reason = skippedNoLock > 0 ? GuardFireBlock.NoRadarLock : skippedNotAuthorized > 0 ? GuardFireBlock.NotAuthorized : skippedNoWeapon > 0 ? GuardFireBlock.NoWeapon : skippedMaxEngaged > 0 ? GuardFireBlock.MaxTargetsEngaged : skippedSaturated > 0 ? GuardFireBlock.QuotaFull : GuardFireBlock.NoTarget;
+                        LogGuardFire(GuardFireChannel.ParallelSalvo, reason, $"targets {parallelTargets.Count}: saturated {skippedSaturated} (Missiles/Tgt {maxPerTarget}), new target over Max Missile Tgts {skippedMaxEngaged} (engaged {engagedTargets}/{maxEngaged}), no ready missile {skippedNoWeapon}, launch checks failed {skippedNotAuthorized}, no radar lock {skippedNoLock} (locks {locksUsed}/{lockCapacity})");
+                    }
+                    yield break;
+                }
                 if (BDArmorySettings.DEBUG_MISSILES) Debug.Log($"[BDArmory.MissileFire]: {vessel.vesselName} parallel salvo against {parallelPlans.Count} targets.");
                 if (waitForRadarLocks) yield return parallelWaitForFixedUpdate; // The radar locks show up in GetLockedTargets once the radars have updated.
                 if (SetCargoBays()) yield return new WaitForSecondsFixed(2f); // Bays containing the current missile type.
@@ -9817,7 +9969,7 @@ namespace BDArmory.Control
                             parallelRailsThisFrame.Clear();
                             continue;
                         }
-                        var ml = PickParallelCandidate(out bool blockedThisFrame);
+                        var ml = PickParallelCandidate(out bool blockedThisFrame, out int launchersLeft);
                         if (ml == null)
                         {
                             if (!blockedThisFrame) break; // Out of missiles of this type for this target.
@@ -9825,26 +9977,32 @@ namespace BDArmory.Control
                             continue;
                         }
                         ++attemptsThisFrame;
+                        // [Overdrive] A multi-missile launcher (VLS, pod) fires its share of what the target still needs in one go: it's busy until its salvo has rippled out,
+                        // so firing one missile per launcher capped the salvo at one missile per launcher (one VLS -> one missile per target).
+                        int share = ParallelPrepareLauncher(ml, plan.slots - fired, launchersLeft);
+                        if (share == 0) { parallelTried.Add(ml); continue; } // An empty launcher.
                         if (ParallelNeedsCoreRoutine(ml, plan))
                         {
                             // Turrets need aiming, laser and anti-radiation missiles need their seekers on the target, GPS missiles without coordinates need a targeting pod:
                             // use the standard guard routine for this missile.
                             int firedBefore = guardMissilesFiredCount;
                             var core = GuardMissileRoutineCore(plan.target, ml);
-                            while (core.MoveNext()) yield return core.Current;
+                            try { while (core.MoveNext()) yield return core.Current; }
+                            finally { ParallelClearLauncher(ml); }
                             currFiringMissile = null;
                             currFiringTarget = null;
                             launchesThisFrame = 0; attemptsThisFrame = 0;
                             parallelRailsThisFrame.Clear();
                             if (guardMissilesFiredCount == firedBefore) break; // Couldn't fire at this target, don't retry with more missiles.
-                            int count = ParallelLaunchCount(ml);
+                            int count = share;
                             fired += count;
                             launchesThisSalvo += count;
                             idleFrames = 0;
                             salvoIdleFrames = 0;
                             continue;
                         }
-                        int launched = TryParallelInstantLaunch(ml, plan, ref heatFailures);
+                        int launched = TryParallelInstantLaunch(ml, plan, share, ref heatFailures);
+                        ParallelClearLauncher(ml);
                         if (launched > 0)
                         {
                             fired += launched;
@@ -9892,7 +10050,6 @@ namespace BDArmory.Control
                     if (launchesThisSalvo > 0) UpdateList(); // Once for the salvo instead of after each launch.
                     RestoreWeaponSelection(primarySelection);
                 }
-                guardFiringMissile = false;
             }
         }
 
@@ -9987,9 +10144,11 @@ namespace BDArmory.Control
         /// Pick the next missile to fire: the least used rail/tube/launcher in this salvo, skipping rails that have launched this frame and missiles already tried for this target.
         /// </summary>
         /// <param name="blockedThisFrame">Whether there are missiles left that are only blocked by their rail having launched this frame.</param>
-        MissileBase PickParallelCandidate(out bool blockedThisFrame)
+        /// <param name="usable">The missiles (launchers) left that haven't been tried for this target, including the one returned.</param>
+        MissileBase PickParallelCandidate(out bool blockedThisFrame, out int usable)
         {
             blockedThisFrame = false;
+            usable = 0;
             int best = -1;
             int bestUses = int.MaxValue;
             for (int i = parallelCandidates.Count - 1; i >= 0; --i)
@@ -10004,6 +10163,7 @@ namespace BDArmory.Control
                     continue;
                 }
                 if (parallelTried.Contains(missile)) continue;
+                ++usable;
                 if (missile is MissileLauncher launcher && launcher.rotaryRail && launcher.rotaryRail.readyMissile != launcher) { blockedThisFrame = true; continue; } // Only the rotary rail's ready missile can fire, the others come round later.
                 var rail = ParallelRailKey(missile);
                 if (parallelRailsThisFrame.Contains(rail)) { blockedThisFrame = true; continue; }
@@ -10029,13 +10189,21 @@ namespace BDArmory.Control
         }
 
         /// <summary>
-        /// How many missiles a launch counts as towards the salvo: a multi-missile launcher fires its whole salvo.
+        /// [Overdrive] How many missiles this launch will fire: 1, or for a multi-missile launcher an even share of what the target still needs over the launchers left
+        /// (GuardFireRules.LauncherSalvoShare), set as the launcher's next salvo size so it fires them all at this target. 0 for an empty launcher.
         /// </summary>
-        static int ParallelLaunchCount(MissileBase missile)
+        static int ParallelPrepareLauncher(MissileBase missile, int remaining, int launchersLeft)
         {
-            if (missile is MissileLauncher launcher && launcher.multiLauncher && launcher.multiLauncher.isMultiLauncher)
-                return Mathf.Max(1, Mathf.RoundToInt(launcher.multiLauncher.salvoSize));
-            return 1;
+            if (!(missile is MissileLauncher launcher && launcher.multiLauncher && launcher.multiLauncher.isMultiLauncher)) return 1;
+            int share = GuardFireRules.LauncherSalvoShare(remaining, launchersLeft, launcher.multiLauncher.ReadyTubes);
+            launcher.multiLauncher.SetNextSalvoSize(share);
+            return share;
+        }
+
+        /// <summary>[Overdrive] Clear a one-shot salvo size the launcher didn't use (it's consumed when its salvo starts).</summary>
+        static void ParallelClearLauncher(MissileBase missile)
+        {
+            if (missile is MissileLauncher launcher && launcher.multiLauncher) launcher.multiLauncher.SetNextSalvoSize(0);
         }
 
         /// <summary>
@@ -10110,8 +10278,8 @@ namespace BDArmory.Control
         /// <summary>
         /// Try to fire the missile at the plan's target right now.
         /// </summary>
-        /// <returns>The number of missiles launched (a multi-missile launcher counts as its salvo size), 0 if the missile couldn't be fired, -1 if its rail isn't ready yet.</returns>
-        int TryParallelInstantLaunch(MissileBase missile, ParallelSalvoPlan plan, ref int heatFailures)
+        /// <returns>The number of missiles launched (count: a multi-missile launcher fires its share), 0 if the missile couldn't be fired, -1 if its rail isn't ready yet.</returns>
+        int TryParallelInstantLaunch(MissileBase missile, ParallelSalvoPlan plan, int count, ref int heatFailures)
         {
             if (missile.launched || missile.HasFired) return 0;
             Vessel targetVessel = plan.target.Vessel;
@@ -10184,7 +10352,6 @@ namespace BDArmory.Control
                 }
             }
 
-            int count = ParallelLaunchCount(missile);
             FireParallelMissile(missile, targetVessel, targetData);
             if (!missile.launched && !missile.HasFired) // The rail or turret didn't fire it.
             {
@@ -10295,6 +10462,7 @@ namespace BDArmory.Control
                 UpdateTargetPriorityUI(currentTarget);
 
             //scan and acquire new target
+            if (BDArmorySettings.DEBUG_GUARD_FIRE && guardFiringMissile && Time.time - targetScanTimer > targetScanInterval) LogGuardFire(GuardFireChannel.GuardScan, GuardFireBlock.RoutineBusy, GuardFireStateDetail());
             if (Time.time - targetScanTimer > targetScanInterval && !guardFiringMissile) // Don't consume the scan while a missile routine is running (the scan was skipped, delaying the next launch by up to a full interval); scan as soon as it finishes.
             {
                 targetScanTimer = Time.time;
@@ -10305,6 +10473,7 @@ namespace BDArmory.Control
 
                     if (guardTarget == null || selectedWeapon == null)
                     {
+                        if (BDArmorySettings.DEBUG_GUARD_FIRE) LogGuardFire(GuardFireChannel.GuardScan, guardTarget == null ? GuardFireBlock.NoTarget : GuardFireBlock.NoWeapon, GuardFireStateDetail());
                         SetCargoBays();
                         SetDeployableWeapons();
                         return;
@@ -10318,6 +10487,7 @@ namespace BDArmory.Control
                             if (fireAuthority == FireAuthority.Hold)
                             {
                                 // [Overdrive F3] Hold: keep the target, weapon selection and locks, but never launch.
+                                if (BDArmorySettings.DEBUG_GUARD_FIRE) LogGuardFire(GuardFireChannel.GuardScan, GuardFireBlock.AuthorityHold, GuardFireStateDetail());
                             }
                             else if (parallelFire)
                             {
@@ -10326,7 +10496,11 @@ namespace BDArmory.Control
                                 if (BDArmorySettings.DEBUG_MISSILES) Debug.Log($"[BDArmory.MissileFire]: {vessel.vesselName} starting parallel salvo; salvo size: {parallelSalvoSize}, missiles/target: {maxMissilesOnTarget}, max missile targets: {multiMissileTgtNum}");
                                 StartCoroutine(GuardParallelSalvoRoutine());
                             }
-                            else if (CurrentMissile != null) // Reloadable rails can give a null missile.
+                            else if (CurrentMissile == null) // Reloadable rails can give a null missile.
+                            {
+                                if (BDArmorySettings.DEBUG_GUARD_FIRE) LogGuardFire(GuardFireChannel.GuardScan, GuardFireBlock.NoWeapon, "no unfired missile of the selected type; " + GuardFireStateDetail());
+                            }
+                            else
                             {
                                 bool pilotAuthorized = true;
                                 //(!pilotAI || pilotAI.GetLaunchAuthorization(guardTarget, this));
@@ -10339,11 +10513,13 @@ namespace BDArmory.Control
                                 if (BDArmorySettings.DEBUG_MISSILES)
                                     Debug.Log($"[BDArmory.MissileFire]: {vessel.vesselName}  launchAuth={launchAuthorized}, pilotAut={pilotAuthorized}, missilesAway/Max={firedMissiles}/{maxMissilesOnTarget}");
 
+                                bool radarLockAvailable = true;
                                 if (firedMissiles < maxMissilesOnTarget)
                                 {
                                     if (CurrentMissile.TargetingMode == MissileBase.TargetingModes.Radar && (CurrentMissile.GetWeaponClass() == WeaponClasses.SLW ? _sonarsEnabled : _radarsEnabled) && !CurrentMissile.radarLOAL && (!vesselRadarData || !vesselRadarData.locked || (vesselRadarData.lockedTargetData.vessel != guardTarget && (EffectiveMaxRadarLocks + vesselRadarData.MaxRadarLocksExternal) <= vesselRadarData.numLockedTargets)))
                                     {
                                         launchAuthorized = false; //don't fire SARH if radar can't support the needed radar lock
+                                        radarLockAvailable = false;
                                         if (BDArmorySettings.DEBUG_MISSILES) Debug.Log("[BDArmory.MissileFire]: radar lock number exceeded to launch!");
                                     }
 
@@ -10357,6 +10533,12 @@ namespace BDArmory.Control
                                 else if (BDArmorySettings.DEBUG_MISSILES)
                                 {
                                     Debug.Log($"[BDArmory.MissileFire]: {vessel.vesselName}  waiting for missile to be ready...");
+                                }
+                                if (BDArmorySettings.DEBUG_GUARD_FIRE)
+                                {
+                                    // Same order as the checks above (GuardFireRules.SerialLaunchDecision); the launch checks passed if launchAuthorized survived everything but the radar lock check.
+                                    var reason = GuardFireRules.SerialLaunchDecision(false, true, true, false, firedMissiles, Mathf.RoundToInt(maxMissilesOnTarget), engagedTargets, Mathf.RoundToInt(multiMissileTgtNum), launchAuthorized || !radarLockAvailable, radarLockAvailable);
+                                    LogGuardFire(GuardFireChannel.GuardScan, reason, $"{CurrentMissile.shortName}; " + GuardFireStateDetail());
                                 }
 
                                 // if (!launchAuthorized || !pilotAuthorized || missilesAway >= maxMissilesOnTarget)
@@ -11103,8 +11285,18 @@ namespace BDArmory.Control
                     //}
                 }
 
+            if (BDArmorySettings.DEBUG_GUARD_FIRE && guardMode && missileCount > 0)
+            {
+                if (PDMslTgts.Count == 0) LogGuardFire(GuardFireChannel.PointDefence, GuardFireBlock.NoThreats);
+                else if (guardFiringMissile) LogGuardFire(GuardFireChannel.PointDefence, GuardFireBlock.RoutineBusy, GuardFireStateDetail());
+            }
             if (guardMode && missileCount > 0 && PDMslTgts.Count > 0 && !guardFiringMissile)
             {
+                float pdNow = Time.time;
+                interceptorAttempts.PruneIfDue(pdNow);
+                interceptorTypeAttempts.PruneIfDue(pdNow);
+                int pdRecentlyFailed = 0; // [Overdrive] DEBUG_GUARD_FIRE
+                bool pdFired = false;
                 int skipIRindex = 0;
                 bool skipIRSigCheck = false;
                 float IRHeatSig = 0;
@@ -11123,7 +11315,26 @@ namespace BDArmory.Control
                 int PDMslTgtsCount = PDMslTgts.Count;
                 // Check to ensure our first target actually is a valid target before doing
                 // all sorts of expensive processing...
-                if (!GetNextPDMslTgt(MissileID, PDMslTgtsCount)) return;
+                bool layered = BDArmorySettings.GUARD_LAYERED_DEFENCE; // [Overdrive] Layered defence: most urgent threat first, longest-range interceptor first.
+                if (layered)
+                {
+                    pdTargetSkips.PruneIfDue(pdNow);
+                    pdReachMin = float.MaxValue; pdReachMax = -1f; // The reach of the interceptors that can still fire (empty launchers and fired missiles don't count).
+                    for (int i = 0; i < pointDefenseMissileArray.Length; ++i)
+                    {
+                        var interceptor = pointDefenseMissileArray[i];
+                        if (interceptor == null || interceptor.HasFired || interceptor.launched) continue;
+                        pdReachMin = Mathf.Min(pdReachMin, interceptor.engageRangeMin);
+                        pdReachMax = Mathf.Max(pdReachMax, interceptor.GetEngagementRangeMax());
+                    }
+                }
+                if (!(layered ? GetMostUrgentPDMslTgt(PDMslTgtsCount, pdNow) : GetNextPDMslTgt(MissileID, PDMslTgtsCount)))
+                {
+                    if (BDArmorySettings.DEBUG_GUARD_FIRE) LogGuardFire(GuardFireChannel.PointDefence, GuardFireBlock.QuotaFull, layered
+                        ? $"{PDMslTgtsCount} incoming missiles: each has its interceptors (Missiles/Tgt {maxMissilesOnTarget}), is outside the reach of the interceptors left ({(pdReachMax < 0 ? "none" : $"{pdReachMin:F0}-{pdReachMax:F0}m")}) or was just found unengageable"
+                        : $"{PDMslTgtsCount} incoming missiles, each with {maxMissilesOnTarget} interceptors away or queued");
+                    return;
+                }
 
                 Vessel targetVessel = PDMslTgts[MissileID].Vessel;
                 float targetDist = Vector3.Distance(vessel.CoM, targetVessel.CoM);
@@ -11132,8 +11343,11 @@ namespace BDArmory.Control
 
                 if (BDArmorySettings.DEBUG_APS)
                     Debug.Log($"[PD Missile Debug - {vessel.GetName()}] PDMslTgt size: {PDMslTgts.Count}; missile count: {missileCount}; pointDefenseMissileMaxRange: {pointDefenseMissileMaxRange}");
-                foreach (MissileBase currMissile in pointDefenseMissileArray) //have guardMode requirement?
+                for (int pdIndex = 0; pdIndex < pointDefenseMissileArray.Length; ++pdIndex) //have guardMode requirement?
                 {
+                    // The interceptors are sorted from the shortest to the longest range: layered defence tries the longest range first (engage as far out as possible,
+                    // keeping the shorter ranges for follow-up shots), falling through to shorter ranges in the same scan; stock tries the shortest first.
+                    MissileBase currMissile = pointDefenseMissileArray[LayeredDefence.InterceptorIndex(pdIndex, pointDefenseMissileArray.Length, layered)];
                     if (BDArmorySettings.DEBUG_APS)
                         Debug.Log($"[BDArmory.MissileFire - {(this.vessel != null ? vessel.GetName() : "null")}]: PD beginning processing for missile: {(currMissile == null ? "null" : currMissile.shortName)}, hasFired: {currMissile.HasFired || currMissile.launched}, for initial target: {(targetVessel != null ? targetVessel.GetName() : "null")} with UUID: {(targetVessel != null ? targetVessel.id : "null")}");
 
@@ -11230,23 +11444,30 @@ namespace BDArmory.Control
                     if (BDArmorySettings.DEBUG_APS)
                         Debug.Log($"[BDArmory.MissileFire - {(this.vessel != null ? vessel.GetName() : "null")}]: PD continuing processing for missile: {currMissile.shortName}, for target: {(targetVessel != null ? targetVessel.GetName() : "null")} with UUID: {(targetVessel != null ? targetVessel.id : "null")} at range: {targetDist}");
 
-                    if (targetDist < currMissile.engageRangeMin)
+                    // [Overdrive] Skip interceptors (and, briefly, interceptor types) that just failed to launch at this target, so the others get a turn (see InterceptorAttemptMemory).
+                    int pdTargetKey = PDMslTgts[MissileID].GetInstanceID();
+                    bool recentlyFailed = interceptorAttempts.IsBlocked(currMissile.GetInstanceID(), pdTargetKey, pdNow) || interceptorTypeAttempts.IsBlocked(InterceptorTypeKey(currMissile), pdTargetKey, pdNow);
+                    switch (GuardFireRules.CheckInterceptor(recentlyFailed, targetDist, currMissile.engageRangeMin))
                     {
-                        Debug.Log($"[BDArmory.MissileFire - {(this.vessel != null ? vessel.GetName() : "null")}]: PD rejected target due to min dist, targetDist/minDist: {targetDist}/{currMissile.engageRangeMin}.");
-                        continue;
+                        case InterceptorPrecheck.RecentlyFailed:
+                            ++pdRecentlyFailed;
+                            continue;
+                        case InterceptorPrecheck.TooClose:
+                            if (BDArmorySettings.DEBUG_APS) Debug.Log($"[BDArmory.MissileFire - {(this.vessel != null ? vessel.GetName() : "null")}]: PD rejected target due to min dist, targetDist/minDist: {targetDist}/{currMissile.engageRangeMin}."); // [Overdrive] Was logged unconditionally (several lines per interceptor every 0.1s).
+                            continue;
                     }
                     bool viableTarget = true;
 
                     if (!CheckEngagementEnvelope(currMissile, targetDist, targetVessel))
                     {
-                        Debug.Log($"[BDArmory.MissileFire - {(this.vessel != null ? vessel.GetName() : "null")}]: PD rejected target due to engagement envelope.");
+                        if (BDArmorySettings.DEBUG_APS) Debug.Log($"[BDArmory.MissileFire - {(this.vessel != null ? vessel.GetName() : "null")}]: PD rejected target due to engagement envelope.");
                         continue;
                     }
                     bool torpedo = launcher && launcher.torpedo; //TODO - work out MMG torpedo support?
                                                                  //Also, what about missiles that launch torpedoes?
                     if (targetVessel.Splashed != torpedo)
                     {
-                        Debug.Log($"[BDArmory.MissileFire - {(this.vessel != null ? vessel.GetName() : "null")}]: PD rejected splashed target due to non-torpedo.");
+                        if (BDArmorySettings.DEBUG_APS) Debug.Log($"[BDArmory.MissileFire - {(this.vessel != null ? vessel.GetName() : "null")}]: PD rejected splashed target due to non-torpedo.");
                         continue; // If there is a type mismatch, skip current missile
                     }
 
@@ -11488,7 +11709,9 @@ namespace BDArmory.Control
                         //missileTarget = targetVessel;
                         if (BDArmorySettings.DEBUG_APS)
                             Debug.Log($"[BDArmory.MissileFire] firing interceptor missile: {currMissile.shortName} at {targetVessel.vesselName}");
-                        StartCoroutine(GuardMissileRoutine(PDMslTgts[MissileID], currMissile));
+                        if (BDArmorySettings.DEBUG_GUARD_FIRE) LogGuardFire(GuardFireChannel.PointDefence, GuardFireBlock.None, $"{currMissile.shortName} (range {currMissile.engageRangeMin:F0}-{currMissile.engageRangeMax:F0}m) at {targetVessel.vesselName}, {targetDist:F0}m, time to impact {PDTargetTimeToImpact(PDMslTgts[MissileID]):F1}s{(layered ? ", layered" : "")}");
+                        StartCoroutine(GuardMissileRoutine(PDMslTgts[MissileID], currMissile, pointDefence: true));
+                        pdFired = true;
                         break;
                     }
                     else
@@ -11496,24 +11719,58 @@ namespace BDArmory.Control
                         continue;
 
                 }
+                if (!pdFired && BDArmorySettings.DEBUG_GUARD_FIRE) LogGuardFire(GuardFireChannel.PointDefence, GuardFireBlock.NoInterceptor, $"{PDMslTgtsCount} incoming missiles; target {(targetVessel != null ? targetVessel.vesselName : "none")} at {targetDist:F0}m; {pointDefenseMissileArray.Length} interceptors (max range {pointDefenseMissileMaxRange:F0}m); {pdRecentlyFailed} skipped after failing to launch at it");
                 // Move to the next target for the next scan...
-                if (changeTargets)
+                if (layered)
+                {
+                    // The most urgent threat is picked again next scan; if nothing could engage it, skip it briefly so the next one gets a turn.
+                    if (!pdFired && MissileID < PDMslTgts.Count && PDMslTgts[MissileID] != null) pdTargetSkips.RecordFailure(0, PDMslTgts[MissileID].GetInstanceID(), pdNow, LayeredDefence.TargetSkipTime);
+                }
+                else if (changeTargets)
                     GetNextPDMslTgt(++MissileID, PDMslTgtsCount);
             }
         }
 
+        /// <summary>
+        /// [Overdrive] Layered defence: pick the incoming missile closest to impact that still needs interceptors (Missiles/Tgt, or 2 within the shoot-shoot time),
+        /// is within the interceptors' reach and wasn't just found unengageable. False if there's none.
+        /// </summary>
+        bool GetMostUrgentPDMslTgt(int tgtCount, float now)
+        {
+            pdUrgencyNow = now;
+            pdTargetTimeToImpact ??= i => PDTargetTimeToImpact(PDMslTgts[i]);
+            pdTargetExcluded ??= i =>
+            {
+                var target = PDMslTgts[i];
+                if (target == null || target.Vessel == null) return true;
+                if (!LayeredDefence.InReach(Vector3.Distance(vessel.CoM, target.Vessel.CoM), pdReachMin, pdReachMax)) return true; // No interceptor that can still fire reaches it from here.
+                float shootShoot = BDArmorySettings.GUARD_SHOOT_SHOOT_TTI;
+                int quota = LayeredDefence.PerTargetQuota(Mathf.RoundToInt(maxMissilesOnTarget), shootShoot > 0f ? PDTargetTimeToImpact(target) : float.PositiveInfinity, shootShoot);
+                return GuardFireRules.TargetSaturated(GetMissilesAway(target).numAway, quota) || pdTargetSkips.IsBlocked(0, target.GetInstanceID(), pdUrgencyNow);
+            };
+            int next = LayeredDefence.MostUrgentIndex(Mathf.Min(tgtCount, PDMslTgts.Count), pdTargetTimeToImpact, pdTargetExcluded);
+            if (next < 0) return false;
+            MissileID = next;
+            return true;
+        }
+
+        /// <summary>[Overdrive] Time for an incoming missile to reach us at its current closing speed (LayeredDefence.TimeToImpact).</summary>
+        float PDTargetTimeToImpact(TargetInfo target)
+        {
+            if (target == null || target.Vessel == null) return 2f * LayeredDefence.NoClosingTime;
+            Vector3 relPos = target.Vessel.CoM - vessel.CoM;
+            float distance = relPos.magnitude;
+            float closingSpeed = distance > 0f ? -Vector3.Dot(target.Vessel.Velocity() - vessel.Velocity(), relPos) / distance : 0f;
+            return LayeredDefence.TimeToImpact(distance, closingSpeed);
+        }
+
         public bool GetNextPDMslTgt(int currIndex, int tgtCount)
         {
-            if (currIndex >= tgtCount) currIndex = 0;
-            int temp = currIndex;
-            while (GetMissilesAway(PDMslTgts[currIndex]).numAway >= maxMissilesOnTarget)
-            {
-                currIndex++;
-                if (currIndex >= tgtCount) currIndex = 0;
-                // If we've searched all missiles and all targets are accounted for, return
-                if (currIndex == temp)
-                    return false;
-            }
+            // The first incoming missile at or after currIndex (wrapping round) without its Missiles/Tgt interceptors; false if they all have them.
+            pdTargetSaturated ??= i => GuardFireRules.TargetSaturated(GetMissilesAway(PDMslTgts[i]).numAway, Mathf.RoundToInt(maxMissilesOnTarget));
+            int next = GuardFireRules.NextUnsaturatedIndex(Mathf.Min(tgtCount, PDMslTgts.Count), currIndex, pdTargetSaturated);
+            if (next < 0) return false;
+            currIndex = next;
             MissileID = currIndex;
             //if (BDArmorySettings.DEBUG_APS)
             //    Debug.Log($"[BDArmory.MissileFire - {(this.vessel != null ? vessel.GetName() : "null")}]: PD Selected target: {(PDMslTgts[currIndex].Vessel != null ? PDMslTgts[currIndex].Vessel.GetName() : "null")} has: {GetMissilesAway(PDMslTgts[currIndex])[0]} interceptors targeted");

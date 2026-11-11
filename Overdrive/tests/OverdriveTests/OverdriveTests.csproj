@@ -11,6 +11,7 @@
 
   <ItemGroup>
     <Compile Include="..\..\..\BDArmory\Control\FireAuthority.cs" Link="Linked\FireAuthority.cs" />
+    <Compile Include="..\..\..\BDArmory\Control\GuardFireLogic.cs" Link="Linked\GuardFireLogic.cs" />
     <Compile Include="..\..\..\BDArmory\VesselSpawning\MultiSpawnLayout.cs" Link="Linked\MultiSpawnLayout.cs" />
   </ItemGroup>
 

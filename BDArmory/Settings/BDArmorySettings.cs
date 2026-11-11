@@ -100,6 +100,8 @@ namespace BDArmory.Settings
         [BDAPersistentSettingsField] public static bool RADAR_ALLOW_SURFACE_WARFARE = true;
         [BDAPersistentSettingsField] public static bool RADAR_LOCKS_FOLLOW_MULTITARGET = true; // In guard mode, lock-capable radars can lock as many targets as the weapon manager's multi-target settings (instead of being limited to the part's maxLocks).
         [BDAPersistentSettingsField] public static bool MISSILE_RETARGETING = true;            // Missiles whose target is destroyed retarget the nearest remaining hostile within their seeker/guidance capability.
+        [BDAPersistentSettingsField] public static bool GUARD_LAYERED_DEFENCE = true;          // [Overdrive] Guard mode point defence against incoming missiles: most urgent threat (time to impact) first, longest-range interceptor whose envelope fits first, falling through to shorter ranges. False: stock order (round-robin threats, shortest-range interceptor first).
+        [BDAPersistentSettingsField] public static float GUARD_SHOOT_SHOOT_TTI = 0f;           // [Overdrive] With layered defence, allow two interceptors at once (shoot-shoot) at incoming missiles this many seconds or less from impact, even with Missiles/Tgt 1. 0: off (shoot-look-shoot).
         [BDAPersistentSettingsField] public static float RADAR_NOTCHING_FACTOR = 1f;
         [BDAPersistentSettingsField] public static float RADAR_NOTCHING_SCR_FACTOR = 0.01f;
         [BDAPersistentSettingsField] public static bool DISPLAY_PATHING_GRID = false;             //laggy when the grid gets large
@@ -126,6 +128,7 @@ namespace BDArmory.Settings
         [BDAPersistentSettingsField] public static bool DEBUG_WEAPONS = false;               //Debug messages for guns/rockets/lasers and their projectiles
         [BDAPersistentSettingsField] public static bool DEBUG_APS = false;                   //Debug messages for point defense weapons
         [BDAPersistentSettingsField] public static bool DEBUG_MISSILES = false;              //Missile launch, tracking and targeting debug labels
+        [BDAPersistentSettingsField] public static bool DEBUG_GUARD_FIRE = false;            // [Overdrive] Log why guard mode decides not to fire missiles (no target, quota full, no weapon in range, no lock, authority hold, routine busy, ...), rate limited.
         [BDAPersistentSettingsField] public static bool DEBUG_DAMAGE = false;                //Explosions and battle damage logging
         [BDAPersistentSettingsField] public static bool DEBUG_AI = false;                    //AI debugging
         [BDAPersistentSettingsField] public static bool DEBUG_RADAR = false;                 //FLIR/Radar and RCS debugging
