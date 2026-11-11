@@ -662,9 +662,9 @@ namespace BDArmory.Weapons.Missiles
 
             weaponClass = WeaponClasses.Missile;
             WeaponName = GetShortName();
+            if (HighLogic.LoadedSceneIsFlight) missileName = shortName; // [Overdrive] Was only set with a custom turret: otherwise it stayed empty, so GetMissileCount gave up and the weapon list always showed "Remaining: 0", and every modular missile design shared the same (empty) part name in weapon selection.
             if (HighLogic.LoadedSceneIsFlight && customTurretID > 0)
             {
-                missileName = shortName;
                 using (var servo = VesselModuleRegistry.GetModules<ModuleCustomTurret>(vessel).GetEnumerator())
                     while (servo.MoveNext())
                     {
