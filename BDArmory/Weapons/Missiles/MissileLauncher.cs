@@ -2217,6 +2217,7 @@ namespace BDArmory.Weapons.Missiles
 
         public override void OnFixedUpdate()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.MissileFixed); // [Overdrive perf]
             base.OnFixedUpdate();
 
             if (!HighLogic.LoadedSceneIsFlight) return;
@@ -4454,6 +4455,7 @@ namespace BDArmory.Weapons.Missiles
 
         protected override void OnGUI()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.MissileGUI); // [Overdrive perf]
             base.OnGUI();
             if (HighLogic.LoadedSceneIsFlight)
             {

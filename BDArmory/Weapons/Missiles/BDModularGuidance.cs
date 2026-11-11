@@ -364,6 +364,7 @@ namespace BDArmory.Weapons.Missiles
 
         public override void OnFixedUpdate()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.ModularMissileFixed); // [Overdrive perf]
             base.OnFixedUpdate();
 
             if (!HighLogic.LoadedSceneIsFlight) return;

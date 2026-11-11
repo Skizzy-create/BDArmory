@@ -2051,6 +2051,7 @@ namespace BDArmory.Control
 
         void FixedUpdate()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.PilotAIFixed); // [Overdrive perf]
             //floating origin and velocity offloading corrections
             if (!HighLogic.LoadedSceneIsFlight) return;
             if (BDKrakensbane.IsActive)
@@ -2082,6 +2083,7 @@ namespace BDArmory.Control
         // This is triggered every Time.fixedDeltaTime.
         protected override void AutoPilot(FlightCtrlState s)
         {
+            using var _perf = PerfProbe.Scope(PerfSection.PilotAIFlyByWire); // [Overdrive perf]
             // Reset and update various internal values and checks. Then update the pilot logic for the physics frame.
 
             //default brakes off full throttle

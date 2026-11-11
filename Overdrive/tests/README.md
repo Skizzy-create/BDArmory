@@ -2,7 +2,8 @@
 
 Dependency-free tests (no NuGet, no test framework) for the pure-logic Overdrive files:
 `BDArmory/Control/FireAuthority.cs`, `BDArmory/Control/GuardFireLogic.cs` (guard mode missile fire: launch flag,
-quotas, weapon type readiness, point defence retries) and `BDArmory/VesselSpawning/MultiSpawnLayout.cs`.
+quotas, weapon type readiness, point defence retries), `BDArmory/VesselSpawning/MultiSpawnLayout.cs`, and the perf probe
+and perf logic (`BDArmory/Utils/PerfProbe.cs`, `BDArmory/Utils/PerfLogic.cs`; see `Overdrive/PERF.md`).
 
 Run from the repository root (the folder that contains `BDArmory/` and `Overdrive/`):
 

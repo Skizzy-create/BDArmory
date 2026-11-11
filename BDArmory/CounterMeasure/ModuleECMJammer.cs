@@ -179,6 +179,7 @@ namespace BDArmory.CounterMeasure
                 if (!vesselJammer)
                 {
                     vesselJammer = vessel.gameObject.AddComponent<VesselECMJInfo>();
+                    vesselJammer.Register(); // [Overdrive perf] Also registered in Awake, which is deferred if the GameObject is inactive.
                 }
             }
 

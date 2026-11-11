@@ -263,6 +263,7 @@ namespace BDArmory.Bullets
 
         void FixedUpdate()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.Rockets); // [Overdrive perf]
             if (!gameObject.activeInHierarchy)
             {
                 return;

@@ -1465,6 +1465,7 @@ namespace BDArmory.Radar
                     if (loadedvessels.Current == null || !loadedvessels.Current.loaded) continue;
                     if ((loadedvessels.Current == v) || (loadedvessels.Current == targetV)) continue;
                     if (loadedvessels.Current.vesselType == VesselType.Debris) continue;
+                    if (!VesselECMJInfo.MayBeAttachedTo(loadedvessels.Current.gameObject)) continue; // [Overdrive perf] No jammer info (e.g., missiles): GetComponent below would return null, so skip the WM lookup and GetComponent.
 
                     MissileFire wm = loadedvessels.Current.ActiveController().WM;
 
@@ -1768,6 +1769,7 @@ namespace BDArmory.Radar
         //was: UpdateRadarLock(ray, maxOffBoresight, activeRadarMinThresh, ref scannedTargets, 0.4f, true, RadarWarningReceiver.RWRThreatTypes.MissileLock, true);
         public static int RadarUpdateMissileLock(Ray ray, float fov, ref TargetSignatureData[] dataArray, float dataPersistTime, MissileBase missile, bool pingRWR)
         {
+            using var _perf = PerfProbe.Scope(PerfSection.RadarMissileLock); // [Overdrive perf]
             int dataIndex = 0;
             //bool hasLocked = false;
 
@@ -1942,6 +1944,7 @@ namespace BDArmory.Radar
         /// <returns></returns>
         public static bool RadarUpdateScanLock(MissileFire myWpnManager, float directionAngle, float elevationAngle, float azFov, float elFov, ModuleRadar radar, bool modeTryLock, ref TargetSignatureData[] dataArray, float dataPersistTime = 0f)
         {
+            using var _perf = PerfProbe.Scope(PerfSection.RadarScanLock); // [Overdrive perf]
             Vector3 position = radar.currPosition;
             Vector3 forwardVector = radar.currForward;
             Vector3 upVector = radar.currUp;
@@ -2446,6 +2449,7 @@ namespace BDArmory.Radar
         /// </summary>
         public static ViewScanResults GuardScanInDirection(MissileFire myWpnManager, Transform referenceTransform, float fov, float maxViewDistance, RadarWarningReceiver RWR = null)
         {
+            using var _perf = PerfProbe.Scope(PerfSection.GuardScan); // [Overdrive perf]
             fov *= 1.1f;
             var results = new ViewScanResults
             {
@@ -2533,13 +2537,17 @@ namespace BDArmory.Radar
 
                     if (tInfo.isMissile)
                     {
+                        MissileBase missileBase = tInfo.MissileBaseModule;
+                        // [Overdrive perf] Check the cheap gates before the terrain raycast. Our own missiles, and missiles that neither the MWS, sight nor the RWR can detect, are skipped below
+                        // whether terrain blocks them or not, and the gates have no side effects, so skipping them first gives the same results without a raycast per missile per weapon manager per frame.
+                        if (missileBase != null && (missileBase.SourceVessel == myWpnManager.vessel || !GuardScanMissileCouldBeDetected(missileBase, loadedvessels.Current, vesselDistanceSqr, vesselProjectedDirection, lookDirection, fov, maxViewDistance, maxMWSDistance, RWR))) continue;
+
                         // This is performed in CanSeeTarget for regular vessels
                         if (TerrainCheck(position, loadedvessels.Current.CoM, loadedvessels.Current.mainBody))
                         {
                             continue; //blocked by terrain
                         }
 
-                        MissileBase missileBase = tInfo.MissileBaseModule;
                         if (missileBase == null)
                         {
                             Debug.LogWarning($"[BDArmory.RadarUtils]: Supposed missile ({loadedvessels.Current.vesselName}) has no MissileBase!");
@@ -2711,6 +2719,34 @@ namespace BDArmory.Radar
             }
 
             return results;
+        }
+
+        /// <summary>
+        /// [Overdrive perf] Whether the guard view scan's MWS, sight or RWR gates would let this missile through (the same conditions as in GuardScanInDirection, see GuardScanGates).
+        /// No side effects: the MWS check doesn't add RWR display contacts here.
+        /// </summary>
+        /// <param name="fov">The half angle of the scan cone.</param>
+        static bool GuardScanMissileCouldBeDetected(MissileBase missileBase, Vessel missileVessel, float vesselDistanceSqr, Vector3 vesselProjectedDirection, Vector3 lookDirection, float fov, float maxViewDistance, float maxMWSDistance, RadarWarningReceiver RWR)
+        {
+            bool mwsDetects = maxMWSDistance > 0 && RWR.PerformMWSCheck(missileBase, out _, false);
+            float sightDistance = BDArmorySettings.VARIABLE_MISSILE_VISIBILITY ? maxViewDistance * (missileBase.MissileState == MissileBase.MissileStates.Boost ? 1 : (missileBase.MissileState == MissileBase.MissileStates.Cruise ? 0.75f : 0.33f)) : maxViewDistance;
+            bool withinSightDistance = vesselDistanceSqr < sightDistance * sightDistance;
+            bool sightDetects = GuardScanGates.SightDetects(withinSightDistance, withinSightDistance ? VectorUtils.Angle(vesselProjectedDirection, lookDirection) : 0f, fov);
+            bool rwrEnabled = RWR != null && RWR.enabled;
+            bool rwrRejects = false;
+            if (rwrEnabled && !mwsDetects && !sightDetects)
+            {
+                bool activeOrLoalSearching = missileBase.ActiveRadar || missileBase.radarLOALSearching;
+                bool beyondTwiceActiveRange = missileBase.activeRadarRange * missileBase.activeRadarRange * 4f < vesselDistanceSqr;
+                rwrRejects = GuardScanGates.RwrRejects(
+                    missileBase.TargetingMode == MissileBase.TargetingModes.Radar || missileBase.TargetingModeTerminal == MissileBase.TargetingModes.Radar,
+                    activeOrLoalSearching,
+                    beyondTwiceActiveRange,
+                    activeOrLoalSearching && !beyondTwiceActiveRange && RWR.IsRadarMissileDetected(missileVessel), // Only consulted in that case.
+                    missileBase.ActiveRadar,
+                    missileBase.vrd != null);
+            }
+            return GuardScanGates.MissileCouldBeDetected(mwsDetects, sightDetects, rwrEnabled, rwrRejects);
         }
 
         public static bool MissileIsThreat(MissileBase missile, MissileFire mf, bool threatToMeOnly = true, bool ignoreInterceptors = false)

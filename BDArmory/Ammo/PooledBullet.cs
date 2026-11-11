@@ -27,6 +27,7 @@ namespace BDArmory.Bullets
 
         public static void AddBullet(PooledBullet bullet) { Instance.activeBullets.Add(bullet); }
         public static void RemoveBullet(PooledBullet bullet) { Instance.activeBullets.Remove(bullet); }
+        public static int ActiveCount => Instance != null ? Instance.activeBullets.Count : 0; // [Overdrive perf] For the perf probe.
 
         void Awake()
         {
@@ -38,6 +39,7 @@ namespace BDArmory.Bullets
         void FixedUpdate()
         {
             if (activeBullets.Count == 0) return;
+            using var _perf = PerfProbe.Scope(PerfSection.Bullets); // [Overdrive perf]
             var autoSync = Physics.autoSyncTransforms;
             try
             {

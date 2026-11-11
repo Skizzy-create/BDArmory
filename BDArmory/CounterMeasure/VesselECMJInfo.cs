@@ -41,6 +41,38 @@ namespace BDArmory.CounterMeasure
         {
             get { return rcsr; }
         }
+        #region [Overdrive perf] Live instance registry
+        // The GameObjects that have a VesselECMJInfo component, so that RadarUtils.GetStandoffJammingModifier (per radar target per radar and per radar missile target, every frame)
+        // can skip vessels without one before the WM lookup and GetComponent. Registered on creation (ModuleECMJammer's AddComponent and Awake) and removed in OnDestroy,
+        // matching when GetComponent finds the component.
+        static readonly HashSet<VesselECMJInfo> liveInstances = [];
+        static readonly Dictionary<GameObject, int> liveGameObjects = [];
+
+        /// <summary>Whether a VesselECMJInfo may be attached to the GameObject (false: GetComponent&lt;VesselECMJInfo&gt;() would return null).</summary>
+        public static bool MayBeAttachedTo(GameObject gameObject) => gameObject is not null && liveGameObjects.ContainsKey(gameObject);
+
+        public void Register()
+        {
+            if (!liveInstances.Add(this)) return;
+            var go = gameObject;
+            liveGameObjects[go] = liveGameObjects.TryGetValue(go, out int count) ? count + 1 : 1;
+            registeredGameObject = go;
+        }
+        GameObject registeredGameObject;
+
+        void Unregister()
+        {
+            if (!liveInstances.Remove(this)) return;
+            var go = registeredGameObject;
+            registeredGameObject = null;
+            if (go is null || !liveGameObjects.TryGetValue(go, out int count)) return;
+            if (count <= 1) liveGameObjects.Remove(go);
+            else liveGameObjects[go] = count - 1;
+        }
+
+        void Awake() => Register();
+        #endregion
+
         void Start()
         {
             if (!Setup())
@@ -68,6 +100,7 @@ namespace BDArmory.CounterMeasure
 
         void OnDestroy()
         {
+            Unregister(); // [Overdrive perf]
             if (vessel) vessel.OnJustAboutToBeDestroyed -= AboutToBeDestroyed;
             GameEvents.onVesselCreate.Remove(OnVesselCreate);
             GameEvents.onPartJointBreak.Remove(OnPartJointBreak);

@@ -795,6 +795,7 @@ namespace BDArmory.Radar
 
         private void Update()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.VesselRadarData); // [Overdrive perf]
             if (radarCount + irstCount > 0)
             {
                 UpdateInputs();
@@ -803,6 +804,7 @@ namespace BDArmory.Radar
 
         private void LateUpdate()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.VesselRadarData); // [Overdrive perf]
             drawGUI = (HighLogic.LoadedSceneIsFlight && FlightGlobals.ready && !vessel.packed && rCount + iCount > 0 &&
                        vessel.isActiveVessel && BDArmorySetup.GAME_UI_ENABLED && !MapView.MapIsEnabled);
             if (drawGUI)
@@ -811,6 +813,7 @@ namespace BDArmory.Radar
 
         void FixedUpdate()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.VesselRadarData); // [Overdrive perf]
             if (!vessel)
             {
                 Destroy(this);

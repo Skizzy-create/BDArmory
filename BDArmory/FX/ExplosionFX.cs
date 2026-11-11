@@ -758,6 +758,7 @@ namespace BDArmory.FX
 
         void Update()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.Explosions); // [Overdrive perf]
             if (!HighLogic.LoadedSceneIsFlight || !gameObject.activeInHierarchy) return;
 
             if (LightFx != null && BDArmorySettings.LightFX) LightFx.intensity -= 12 * Time.deltaTime;
@@ -775,6 +776,7 @@ namespace BDArmory.FX
 
         public void FixedUpdate()
         {
+            using var _perf = PerfProbe.Scope(PerfSection.Explosions); // [Overdrive perf]
             if (!HighLogic.LoadedSceneIsFlight || !gameObject.activeInHierarchy) return;
 
             if (UI.BDArmorySetup.GameIsPaused)

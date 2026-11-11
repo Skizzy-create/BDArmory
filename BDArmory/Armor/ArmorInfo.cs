@@ -40,6 +40,28 @@ namespace BDArmory.Armor
         //public bool Reactive {get; private set; } have a reactive armor bool?
 
         public static ArmorInfos armors;
+
+        static ArmorInfos noneIndexList = null;
+        static int noneIndexCount = -1;
+        static int noneIndex = -1;
+        /// <summary>
+        /// [Overdrive perf] armors.FindIndex(t => t.name == "None"), cached: HitpointTracker.FixedUpdate needs it for every part every physics frame.
+        /// The armour definitions are only loaded once (see Load) and names can't change afterwards; the cache is recomputed if the list is replaced or resized.
+        /// </summary>
+        public static int NoneIndex
+        {
+            get
+            {
+                var list = armors;
+                if (!ReferenceEquals(list, noneIndexList) || list.Count != noneIndexCount)
+                {
+                    noneIndex = list.FindIndex(t => t.name == "None");
+                    noneIndexList = list;
+                    noneIndexCount = list.Count;
+                }
+                return noneIndex;
+            }
+        }
         public static List<string> armorNames;
         public static ArmorInfo defaultArmor;
 
