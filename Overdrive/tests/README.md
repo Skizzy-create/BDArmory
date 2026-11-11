@@ -1,7 +1,8 @@
 # Overdrive unit tests
 
 Dependency-free tests (no NuGet, no test framework) for the pure-logic Overdrive files:
-`BDArmory/Control/FireAuthority.cs` and `BDArmory/VesselSpawning/MultiSpawnLayout.cs`.
+`BDArmory/Control/FireAuthority.cs`, `BDArmory/Control/GuardFireLogic.cs` (guard mode missile fire: launch flag,
+quotas, weapon type readiness, point defence retries) and `BDArmory/VesselSpawning/MultiSpawnLayout.cs`.
 
 Run from the repository root (the folder that contains `BDArmory/` and `Overdrive/`):
 
